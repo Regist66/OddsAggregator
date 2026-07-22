@@ -1,0 +1,114 @@
+{
+  "version": 1,
+  "teams": {
+    "agf": [
+      "AGF",
+      "Aarhus GF",
+      "AGF Aarhus"
+    ],
+    "the_new_saints": [
+      "The New Saints",
+      "TNS"
+    ],
+    "dunajska_streda": [
+      "Dunajska Streda",
+      "DAC",
+      "FC DAC 1904"
+    ],
+    "fc_copenhagen": [
+      "FC Copenhagen",
+      "Copenhagen",
+      "FC Köbenhavn",
+      "Köbenhavn"
+    ],
+    "polissya_zhytomyr": [
+      "Polissya Zhytomyr",
+      "Polisszja Zsitomir"
+    ],
+    "nottingham_forest": [
+      "Nottingham Forest",
+      "Nottm Forest"
+    ],
+    "universitatea_craiova": [
+      "Universitatea Craiova",
+      "CS Universitatea Craiova",
+      "CS Univ. Craiova"
+    ],
+    "manchester_united": [
+      "Manchester United",
+      "Manchester Utd",
+      "Man Utd"
+    ],
+    "hull_city": [
+      "Hull City",
+      "Hull"
+    ],
+    "gbk_kokkola": [
+      "GBK Kokkola",
+      "GBK"
+    ],
+    "jaro_ii": [
+      "FF Jaro II",
+      "Jaro II",
+      "Jaro 2"
+    ],
+    "levski_sofia": [
+      "PFC Levski Sofia",
+      "Levski Sofia",
+      "Levszki Szófia"
+    ],
+    "kairat_almaty": [
+      "Kairat Almaty",
+      "Kajrat Almati"
+    ],
+    "celje": [
+      "NK Celje",
+      "Celje"
+    ],
+    "qarabag": [
+      "Qarabag FK",
+      "Qarabag Baku"
+    ],
+    "cska_sofia": [
+      "CSKA Sofia",
+      "CSZKA Szófia"
+    ],
+    "viking_stavanger": [
+      "Viking",
+      "Viking Stavanger"
+    ],
+    "inter_turku": [
+      "FC Inter",
+      "Inter Turku"
+    ],
+    "brondby": [
+      "Brondby",
+      "Brøndby IF"
+    ],
+    "bc_maxline": [
+      "BC Maxline",
+      "FC ML Vitebsk"
+    ],
+    "paide_linnameeskond": [
+      "Paide Linnameeskond",
+      "Flora Paide"
+    ],
+    "olmaliq": [
+      "Olmaliq",
+      "FK AGMK"
+    ],
+    "paok": [
+      "PAOK",
+      "PAOK Szaloniki"
+    ],
+    "athletico_paranaense": [
+      "Athletico-PR",
+      "Athletico Paranaense",
+      "Paranaense"
+    ],
+    "qpr": [
+      "QPR",
+      "Queens Park Rangers"
+    ]
+  }
+}
