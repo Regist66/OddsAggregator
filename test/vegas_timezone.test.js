@@ -60,3 +60,25 @@ test("a partial Vegas catalogue refresh keeps the previous complete catalogue", 
     delete globalThis.__vegasSoccerCollector;
   }
 });
+
+test("Vegas live refresh uses the short retry timeout", async () => {
+  new Function(`return ${browserCollectorSource()};`)();
+  const collector = globalThis.__vegasSoccerCollector;
+  try {
+    let timeoutMs;
+    collector.request = async (endpoint, suffix, timeout) => {
+      assert.equal(endpoint, "GetLiveOverview");
+      assert.equal(suffix, "&sportId=66");
+      timeoutMs = timeout;
+      return { events: [], markets: [], odds: [], competitors: [], champs: [] };
+    };
+
+    await collector.refreshLive();
+
+    assert.equal(timeoutMs, 4_000);
+    assert.ok(Number.isFinite(collector.lastLiveRefreshAt));
+  } finally {
+    collector.shutdown();
+    delete globalThis.__vegasSoccerCollector;
+  }
+});

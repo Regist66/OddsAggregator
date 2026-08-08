@@ -179,6 +179,31 @@ test("TippmixPro health still rejects a genuinely inconsistent snapshot", t => {
   assert.equal(productionAssessment.state, "snapshot-inconsistent");
 });
 
+test("TippmixPro recovers transient MATCH metadata gaps from the last complete event", t => {
+  const collector = createCollector(t);
+  populateCompleteEvent(collector);
+  const first = collector.getSnapshot();
+  const previous = first.events[0];
+
+  collector.matches.set("event-1", {
+    ...collector.matches.get("event-1"),
+    startTime: null,
+    statusId: null,
+    statusName: null,
+  });
+  const recovered = collector.getSnapshot();
+
+  assert.deepEqual(recovered.snapshotConsistency, {
+    consistent: true,
+    invalidEvents: 0,
+    issues: [],
+    recoveredEvents: 1,
+  });
+  assert.equal(recovered.events[0].startTime, previous.startTime);
+  assert.equal(recovered.events[0].statusId, previous.statusId);
+  assert.equal(recovered.events[0].statusName, previous.statusName);
+});
+
 test("TippmixPro legacy snapshots keep the conservative pending-work gate", () => {
   const legacy = healthySnapshot({ pendingWork: 2 });
   delete legacy.snapshotConsistency;

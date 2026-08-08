@@ -46,6 +46,13 @@ const CONFIG = {
     integer: true,
     min: 250,
   }),
+  // Keep live retries below the comparator's 5s freshness gate. The generic
+  // request timeout remains longer for catalogue/detail calls.
+  liveRequestTimeoutMs: envNumber("VEGAS_LIVE_REQUEST_TIMEOUT_MS", 4_000, {
+    integer: true,
+    min: 100,
+    max: 120_000,
+  }),
   requestTimeoutMs: envNumber("VEGAS_REQUEST_TIMEOUT_MS", 15_000, {
     integer: true,
     min: 100,
@@ -218,6 +225,7 @@ export function browserCollectorSource() {
     catalogueRefreshMs: CONFIG.catalogueRefreshMs,
     enhancedRefreshMs: CONFIG.matchedRefreshMs,
     requestTimeoutMs: CONFIG.requestTimeoutMs,
+    liveRequestTimeoutMs: CONFIG.liveRequestTimeoutMs,
     timezoneOffsetMinutes: CONFIG.timezoneOffsetMinutes,
   });
 
@@ -255,9 +263,9 @@ export function browserCollectorSource() {
         );
       },
 
-      async request(endpoint, parameters = "") {
+      async request(endpoint, parameters = "", timeoutMs = options.requestTimeoutMs) {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), options.requestTimeoutMs);
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
         try {
           const response = await fetch(BASE + endpoint + this.query() + parameters, {
             cache: "no-store",
@@ -436,7 +444,11 @@ export function browserCollectorSource() {
         if (this.liveBusy) return;
         this.liveBusy = true;
         try {
-          const payload = await this.request("GetLiveOverview", "&sportId=66");
+          const payload = await this.request(
+            "GetLiveOverview",
+            "&sportId=66",
+            options.liveRequestTimeoutMs,
+          );
           const currentIds = new Set(this.mapPayload(payload, "live"));
           for (const id of this.liveEventIds) {
             if (!currentIds.has(id)) this.events.delete(id);

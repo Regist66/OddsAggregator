@@ -209,6 +209,10 @@ export function browserCollectorSource() {
       relations: new Map(),
       offers: new Map(),
       tournaments: new Map(),
+      // A WAMP change can briefly update odds before the corresponding MATCH
+      // metadata arrives. Keep the last complete event so that one partial
+      // record cannot invalidate the whole published snapshot.
+      lastValidEvents: new Map(),
       lastCatalogueRefreshAt: null,
       lastFrameAt: null,
       lastError: null,
@@ -697,6 +701,7 @@ export function browserCollectorSource() {
 
         const events = [];
         const consistencyIssues = new Set();
+        let recoveredEvents = 0;
         let invalidEvents = 0;
         for (const [eventId, marketTypes] of marketsByEvent) {
           const match = this.matches.get(eventId);
@@ -705,7 +710,7 @@ export function browserCollectorSource() {
           const superOdds = oddsForMarket(marketTypes.super);
           if (!regular && !superOdds) continue;
           const primary = regular ?? superOdds;
-          const event = {
+          let event = {
             eventId,
             eventName: match.name ?? "",
             homeName: match.homeParticipantName ?? "",
@@ -732,35 +737,55 @@ export function browserCollectorSource() {
               superOdds?.lastChangedTime ?? 0,
             ),
           };
-          let eventValid = true;
-          if (!String(event.eventId ?? "").trim()) {
-            consistencyIssues.add("event-id-missing");
-            eventValid = false;
+          const validateEvent = candidate => {
+            const issues = [];
+            if (!String(candidate.eventId ?? "").trim()) issues.push("event-id-missing");
+            if (!Number.isFinite(candidate.startTime) || candidate.startTime <= 0) {
+              issues.push("event-start-time-invalid");
+            }
+            if (
+              !Array.isArray(candidate.odds) ||
+              candidate.odds.length !== 3 ||
+              candidate.odds.some(value => !Number.isFinite(value) || value <= 0)
+            ) {
+              issues.push("event-odds-invalid");
+            }
+            if (typeof candidate.inPlay !== "boolean") issues.push("event-in-play-invalid");
+            if (
+              (candidate.statusId === null || candidate.statusId === undefined || candidate.statusId === "") &&
+              (candidate.statusName === null || candidate.statusName === undefined || candidate.statusName === "")
+            ) {
+              issues.push("event-status-missing");
+            }
+            return issues;
+          };
+
+          let eventIssues = validateEvent(event);
+          const previous = this.lastValidEvents.get(eventId);
+          if (eventIssues.length > 0 && previous) {
+            const recovered = { ...event };
+            if ((!Number.isFinite(recovered.startTime) || recovered.startTime <= 0) &&
+                Number.isFinite(previous.startTime) && previous.startTime > 0) {
+              recovered.startTime = previous.startTime;
+            }
+            const statusMissing =
+              (recovered.statusId === null || recovered.statusId === undefined || recovered.statusId === "") &&
+              (recovered.statusName === null || recovered.statusName === undefined || recovered.statusName === "");
+            if (statusMissing) {
+              recovered.statusId = previous.statusId;
+              recovered.statusName = previous.statusName;
+            }
+            const recoveredIssues = validateEvent(recovered);
+            if (recoveredIssues.length === 0) {
+              event = recovered;
+              eventIssues = recoveredIssues;
+              recoveredEvents += 1;
+            }
           }
-          if (!Number.isFinite(event.startTime) || event.startTime <= 0) {
-            consistencyIssues.add("event-start-time-invalid");
-            eventValid = false;
-          }
-          if (
-            !Array.isArray(event.odds) ||
-            event.odds.length !== 3 ||
-            event.odds.some(value => !Number.isFinite(value) || value <= 0)
-          ) {
-            consistencyIssues.add("event-odds-invalid");
-            eventValid = false;
-          }
-          if (typeof event.inPlay !== "boolean") {
-            consistencyIssues.add("event-in-play-invalid");
-            eventValid = false;
-          }
-          if (
-            (event.statusId === null || event.statusId === undefined || event.statusId === "") &&
-            (event.statusName === null || event.statusName === undefined || event.statusName === "")
-          ) {
-            consistencyIssues.add("event-status-missing");
-            eventValid = false;
-          }
-          if (!eventValid) invalidEvents += 1;
+
+          for (const issue of eventIssues) consistencyIssues.add(issue);
+          if (eventIssues.length > 0) invalidEvents += 1;
+          else this.lastValidEvents.set(eventId, { ...event });
           events.push(event);
         }
         events.sort((left, right) => left.startTime - right.startTime);
@@ -772,6 +797,12 @@ export function browserCollectorSource() {
         };
         const pendingWork = Object.values(pendingWorkDetails)
           .reduce((total, value) => total + value, 0);
+        const snapshotConsistency = {
+          consistent: invalidEvents === 0,
+          invalidEvents,
+          issues: [...consistencyIssues],
+        };
+        if (recoveredEvents > 0) snapshotConsistency.recoveredEvents = recoveredEvents;
         return {
           generatedAt: Date.now(),
           connected: this.connected,
@@ -780,11 +811,7 @@ export function browserCollectorSource() {
           // every catalogue refresh or subscription as snapshot-blocking work.
           pendingWork,
           pendingWorkDetails,
-          snapshotConsistency: {
-            consistent: invalidEvents === 0,
-            invalidEvents,
-            issues: [...consistencyIssues],
-          },
+          snapshotConsistency,
           tournamentCount: this.tournaments.size,
           subscribedTopics: this.subscribedTopics.size,
           lastCatalogueRefreshAt: this.lastCatalogueRefreshAt,

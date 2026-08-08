@@ -22,6 +22,7 @@ New-Item -ItemType Directory -Force -Path $dataDir, $logsDir, $comparisonDir | O
 $script:runStartedAt = [DateTimeOffset]::UtcNow
 $script:runDeadline = $script:runStartedAt.AddMinutes($effectiveDurationMinutes)
 $script:readyAt = $null
+$script:completedAt = $null
 $script:cleanupCompletedAt = $null
 $script:docker = $null
 $script:cleanupStack = @()
@@ -48,6 +49,7 @@ function Write-RunManifest {
         deadlineAt = $script:runDeadline.ToString("o")
         deadlineUnixMs = $script:runDeadline.ToUnixTimeMilliseconds()
         readyAt = if ($script:readyAt) { $script:readyAt.ToString("o") } else { $null }
+        completedAt = if ($script:completedAt) { $script:completedAt.ToString("o") } else { $null }
         cleanupCompletedAt = if ($script:cleanupCompletedAt) { $script:cleanupCompletedAt.ToString("o") } else { $null }
         dataDir = $dataDir
         logsDir = $logsDir
@@ -176,6 +178,41 @@ function Invoke-StartupCleanup {
             try { $null = & $script:docker rm --force $resource.Id 2>$null } catch { }
         }
     }
+}
+
+function Wait-RunCompletion {
+    param(
+        [Parameter(Mandatory = $true)][array]$Collectors,
+        [Parameter(Mandatory = $true)][array]$Comparators
+    )
+
+    # The launcher remains the watchdog until the shared deadline. This makes
+    # the manifest authoritative instead of leaving it at status=running after
+    # the child processes have already exited.
+    while ([DateTimeOffset]::UtcNow -lt $script:runDeadline) {
+        foreach ($comparator in $Comparators) {
+            if ($comparator.HasExited) {
+                throw "A $($comparator.Id) comparator a deadline elott kilepett (exit=$($comparator.ExitCode))."
+            }
+        }
+        foreach ($collector in $Collectors) {
+            Assert-CollectorAlive -Collector $collector
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    $graceDeadline = [DateTimeOffset]::UtcNow.AddSeconds(30)
+    foreach ($resource in @($script:cleanupStack | Where-Object Kind -eq "Process")) {
+        $process = $resource.Handle
+        while (-not $process.HasExited -and [DateTimeOffset]::UtcNow -lt $graceDeadline) {
+            $null = $process.WaitForExit(500)
+        }
+    }
+
+    Invoke-StartupCleanup
+    $script:cleanupCompletedAt = [DateTimeOffset]::UtcNow
+    $script:completedAt = $script:cleanupCompletedAt
+    Write-RunManifest -Status "completed"
 }
 
 $collectors = @(
@@ -310,3 +347,14 @@ Write-Host "Halozat: $networkDescription"
 Write-Host "Adatok: $dataDir"
 Write-Host "Osszevetes: $comparisonDir"
 Write-Host "Run manifest: $manifestFile"
+
+try {
+    Wait-RunCompletion -Collectors $collectorStates -Comparators $comparatorProcesses
+    Write-Host "Haromforrasos direct shadow teszt befejezodott: $runId" -ForegroundColor Green
+} catch {
+    $runError = $_.Exception
+    Invoke-StartupCleanup
+    $script:cleanupCompletedAt = [DateTimeOffset]::UtcNow
+    try { Write-RunManifest -Status "failed" -Failure $runError.Message } catch { }
+    throw $runError
+}
