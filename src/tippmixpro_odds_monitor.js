@@ -177,7 +177,7 @@ async function findTarget() {
 
 export function browserCollectorSource() {
   return `(() => {
-    const VERSION = 1;
+    const VERSION = 2;
     const BASE = "/sports/2901/hu/";
     const AGGREGATOR_SUFFIX = "/default-event-info/BOTH/1380,1381,1382";
     const TARGET_DISPLAY_KEY = "b69_ep3";
@@ -696,6 +696,8 @@ export function browserCollectorSource() {
         };
 
         const events = [];
+        const consistencyIssues = new Set();
+        let invalidEvents = 0;
         for (const [eventId, marketTypes] of marketsByEvent) {
           const match = this.matches.get(eventId);
           if (!match) continue;
@@ -703,7 +705,7 @@ export function browserCollectorSource() {
           const superOdds = oddsForMarket(marketTypes.super);
           if (!regular && !superOdds) continue;
           const primary = regular ?? superOdds;
-          events.push({
+          const event = {
             eventId,
             eventName: match.name ?? "",
             homeName: match.homeParticipantName ?? "",
@@ -729,17 +731,60 @@ export function browserCollectorSource() {
               regular?.lastChangedTime ?? 0,
               superOdds?.lastChangedTime ?? 0,
             ),
-          });
+          };
+          let eventValid = true;
+          if (!String(event.eventId ?? "").trim()) {
+            consistencyIssues.add("event-id-missing");
+            eventValid = false;
+          }
+          if (!Number.isFinite(event.startTime) || event.startTime <= 0) {
+            consistencyIssues.add("event-start-time-invalid");
+            eventValid = false;
+          }
+          if (
+            !Array.isArray(event.odds) ||
+            event.odds.length !== 3 ||
+            event.odds.some(value => !Number.isFinite(value) || value <= 0)
+          ) {
+            consistencyIssues.add("event-odds-invalid");
+            eventValid = false;
+          }
+          if (typeof event.inPlay !== "boolean") {
+            consistencyIssues.add("event-in-play-invalid");
+            eventValid = false;
+          }
+          if (
+            (event.statusId === null || event.statusId === undefined || event.statusId === "") &&
+            (event.statusName === null || event.statusName === undefined || event.statusName === "")
+          ) {
+            consistencyIssues.add("event-status-missing");
+            eventValid = false;
+          }
+          if (!eventValid) invalidEvents += 1;
+          events.push(event);
         }
         events.sort((left, right) => left.startTime - right.startTime);
+        const pendingWorkDetails = {
+          catalogueRequests: this.pendingRpcs.size,
+          topicRegistrations: this.pendingRegistrations.size,
+          initialDumps: this.pendingCalls.size,
+          queuedOffers: this.queuedOfferIds.size,
+        };
+        const pendingWork = Object.values(pendingWorkDetails)
+          .reduce((total, value) => total + value, 0);
         return {
           generatedAt: Date.now(),
           connected: this.connected,
-          pendingWork:
-            this.pendingRegistrations.size +
-            this.pendingCalls.size +
-            this.pendingRpcs.size +
-            this.queuedOfferIds.size,
+          // Network requests can continue while the current snapshot is already
+          // internally consistent. Keep them as telemetry instead of treating
+          // every catalogue refresh or subscription as snapshot-blocking work.
+          pendingWork,
+          pendingWorkDetails,
+          snapshotConsistency: {
+            consistent: invalidEvents === 0,
+            invalidEvents,
+            issues: [...consistencyIssues],
+          },
           tournamentCount: this.tournaments.size,
           subscribedTopics: this.subscribedTopics.size,
           lastCatalogueRefreshAt: this.lastCatalogueRefreshAt,

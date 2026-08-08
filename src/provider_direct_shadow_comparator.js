@@ -204,11 +204,48 @@ export function sideHealth(side, policy, now = Date.now()) {
   if (provider === "tippmixpro") {
     sourceHealth.connected = safeDocument.connected === true;
     sourceHealth.pendingWork = Number(safeDocument.pendingWork);
+    sourceHealth.pendingWorkDetails = safeDocument.pendingWorkDetails ?? null;
     if (safeDocument.connected !== true) reasons.add("disconnected");
     if (!Number.isInteger(sourceHealth.pendingWork) || sourceHealth.pendingWork < 0) {
       reasons.add("pending-work-invalid");
-    } else if (sourceHealth.pendingWork > 0) {
-      reasons.add("pending-work");
+    }
+
+    const hasSnapshotConsistency = Object.hasOwn(safeDocument, "snapshotConsistency");
+    const snapshotConsistency = safeDocument.snapshotConsistency;
+    if (hasSnapshotConsistency) {
+      const validObject =
+        snapshotConsistency &&
+        typeof snapshotConsistency === "object" &&
+        !Array.isArray(snapshotConsistency);
+      const issues = validObject && Array.isArray(snapshotConsistency.issues)
+        ? snapshotConsistency.issues
+        : null;
+      const invalidEvents = validObject ? Number(snapshotConsistency.invalidEvents) : Number.NaN;
+      sourceHealth.snapshotConsistent = validObject
+        ? snapshotConsistency.consistent === true
+        : null;
+      sourceHealth.snapshotInvalidEvents = Number.isFinite(invalidEvents) ? invalidEvents : null;
+      sourceHealth.snapshotConsistencyIssues = issues;
+      if (
+        !validObject ||
+        typeof snapshotConsistency.consistent !== "boolean" ||
+        !Number.isInteger(invalidEvents) ||
+        invalidEvents < 0 ||
+        !issues ||
+        issues.some(issue => typeof issue !== "string" || !issue) ||
+        snapshotConsistency.consistent !== (invalidEvents === 0 && issues.length === 0)
+      ) {
+        reasons.add("snapshot-consistency-invalid");
+      } else if (!snapshotConsistency.consistent) {
+        reasons.add("snapshot-inconsistent");
+      }
+    } else {
+      sourceHealth.snapshotConsistent = null;
+      sourceHealth.snapshotInvalidEvents = null;
+      sourceHealth.snapshotConsistencyIssues = null;
+      // Legacy collectors did not distinguish background protocol work from
+      // snapshot-blocking work, so retain the conservative legacy gate.
+      if (sourceHealth.pendingWork > 0) reasons.add("pending-work");
     }
     const frame = freshness(reasons, safeDocument, "lastFrameAt", policy.tippmixFrameMaxAgeMs, now);
     sourceHealth.lastFrameAt = frame.value;

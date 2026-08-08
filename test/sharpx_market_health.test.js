@@ -30,9 +30,9 @@ function seededCollector({ status = "OPEN", inPlay = true, oddsAgeMs = 0, rc } =
     oddsReceivedAt: Date.now() - oddsAgeMs,
     rc:
       rc ?? [
-        { id: 1, bdatl: [2.1] },
-        { id: 58805, bdatl: [3.2] },
-        { id: 2, bdatl: [3.5] },
+        { id: 1, bdatl: [{ odds: 2.1, amount: 10 }] },
+        { id: 58805, bdatl: [{ odds: 3.2, amount: 20 }] },
+        { id: 2, bdatl: [{ odds: 3.5, amount: 30 }] },
       ],
   });
   collector.connections = [
@@ -68,15 +68,56 @@ test("SharpX excludes stale live prices", () => {
   }
 });
 
-test("SharpX keeps a fresh OPEN market only while it has an executable lay price", () => {
+test("SharpX accepts the real bdatl lay object shape on cold start", () => {
   const collector = seededCollector();
   try {
-    assert.equal(collector.getSnapshot().markets.length, 1);
+    const snapshot = collector.getSnapshot();
+    assert.equal(snapshot.initializedMarkets, 1);
+    assert.equal(snapshot.markets[0].runnerPrices[0].bestLay.odds, 2.1);
     collector.prices.get("1.123").rc = [];
     assert.equal(collector.getSnapshot().markets.length, 0);
   } finally {
     collector.shutdown();
     delete globalThis.__sharpXMatchOddsCollector;
+  }
+});
+
+test("SharpX keeps the last complete prices during a subscription transition", () => {
+  const previousWebSocket = globalThis.WebSocket;
+  class SilentWebSocket {
+    static OPEN = 1;
+    static CONNECTING = 0;
+
+    constructor() {
+      this.readyState = SilentWebSocket.OPEN;
+      this.close = () => {};
+    }
+  }
+
+  globalThis.WebSocket = SilentWebSocket;
+  const collector = seededCollector();
+  try {
+    const previousMarket = collector.catalogue.get("1.123");
+    const nextMarket = {
+      ...previousMarket,
+      marketId: "1.124",
+      eventId: "event-2",
+    };
+    collector.catalogue.set(nextMarket.marketId, nextMarket);
+
+    collector.applySubscriptions([previousMarket, nextMarket]);
+
+    assert.equal(collector.prices.get("1.123").fallback, true);
+    assert.equal(collector.getSnapshot().initializedMarkets, 1);
+
+    collector.prices.get("1.123").receivedAt =
+      Date.now() - collector.options.subscriptionFallbackMaxAgeMs - 1;
+    assert.equal(collector.getSnapshot().initializedMarkets, 0);
+  } finally {
+    collector.shutdown();
+    delete globalThis.__sharpXMatchOddsCollector;
+    if (previousWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = previousWebSocket;
   }
 });
 

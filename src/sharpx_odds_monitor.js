@@ -40,6 +40,11 @@ const CONFIG = {
     integer: true,
     min: 1_000,
   }),
+  subscriptionFallbackMaxAgeMs: envNumber(
+    "SHARPX_SUBSCRIPTION_FALLBACK_MAX_AGE_MS",
+    120_000,
+    { integer: true, min: 1_000 },
+  ),
   outputIntervalMs: envNumber("SHARPX_OUTPUT_INTERVAL_MS", 1_000, {
     integer: true,
     min: 100,
@@ -268,6 +273,7 @@ export function browserCollectorSource() {
     marketsPerSocket: CONFIG.marketsPerSocket,
     livePriceMaxAgeMs: CONFIG.livePriceMaxAgeMs,
     fetchTimeoutMs: CONFIG.fetchTimeoutMs,
+    subscriptionFallbackMaxAgeMs: CONFIG.subscriptionFallbackMaxAgeMs,
   });
 
   return `(() => {
@@ -369,8 +375,33 @@ export function browserCollectorSource() {
         const signature = markets.map(market => market.marketId).sort().join(",");
         if (signature === this.subscriptionSignature) return;
 
+        const previousGeneration = this.generation;
+        const nextGeneration = previousGeneration + 1;
+        const now = Date.now();
+        if (previousGeneration > 0) {
+          for (const market of markets) {
+            const previous = this.prices.get(market.marketId);
+            const receivedAt = Number(previous?.receivedAt);
+            if (
+              previous?.generation !== previousGeneration ||
+              !Number.isFinite(receivedAt) ||
+              now - receivedAt > options.subscriptionFallbackMaxAgeMs
+            ) continue;
+            // Keep the last complete price set visible while the replacement
+            // sockets receive their first frames. Live prices still pass the
+            // normal age gate below; prematch prices are bounded by this
+            // fallback TTL instead of disappearing during every catalogue
+            // refresh.
+            this.prices.set(market.marketId, {
+              ...previous,
+              generation: nextGeneration,
+              fallback: true,
+            });
+          }
+        }
+
         this.subscriptionSignature = signature;
-        this.generation += 1;
+        this.generation = nextGeneration;
         const generation = this.generation;
         this.closeConnections();
 
@@ -460,6 +491,7 @@ export function browserCollectorSource() {
                     ? receivedAt
                     : previous?.oddsReceivedAt ?? null,
                   generation,
+                  fallback: false,
                 });
                 connection.readyMarkets.add(update.id);
               }
@@ -500,7 +532,11 @@ export function browserCollectorSource() {
                 connection.socket.readyState === WebSocket.OPEN &&
                 connection.readyMarkets.has(marketId),
             );
-            if (!healthy) return null;
+            const fallback =
+              price.fallback === true &&
+              Number.isFinite(Number(price.receivedAt)) &&
+              now - Number(price.receivedAt) <= options.subscriptionFallbackMaxAgeMs;
+            if (!healthy && !fallback) return null;
 
             const marketDefinition = price.marketDefinition ?? {};
             return {
@@ -523,7 +559,9 @@ export function browserCollectorSource() {
           .filter(
             market =>
               market.runnerPrices.filter(
-                runner => Number.isFinite(Number(runner.bestLay)) && Number(runner.bestLay) > 1,
+                runner =>
+                  Number.isFinite(Number(runner.bestLay?.odds)) &&
+                  Number(runner.bestLay.odds) > 1,
               ).length >= 1,
           )
           .filter(
@@ -1087,10 +1125,36 @@ export function assessTippmixSnapshot(snapshot, options = {}) {
     return { snapshot: null, state: "disconnected", cacheKey: "disconnected" };
   }
   const pendingWork = Number(snapshot.pendingWork);
-  if (!Number.isFinite(pendingWork) || pendingWork < 0) {
+  if (!Number.isInteger(pendingWork) || pendingWork < 0) {
     return { snapshot: null, state: "health-invalid", cacheKey: "health-invalid" };
   }
-  if (pendingWork > 0) {
+  if (Object.hasOwn(snapshot, "snapshotConsistency")) {
+    const consistency = snapshot.snapshotConsistency;
+    const validObject =
+      consistency && typeof consistency === "object" && !Array.isArray(consistency);
+    const invalidEvents = validObject ? Number(consistency.invalidEvents) : Number.NaN;
+    const issues = validObject && Array.isArray(consistency.issues) ? consistency.issues : null;
+    if (
+      !validObject ||
+      typeof consistency.consistent !== "boolean" ||
+      !Number.isInteger(invalidEvents) ||
+      invalidEvents < 0 ||
+      !issues ||
+      issues.some(issue => typeof issue !== "string" || !issue) ||
+      consistency.consistent !== (invalidEvents === 0 && issues.length === 0)
+    ) {
+      return { snapshot: null, state: "health-invalid", cacheKey: "health-invalid" };
+    }
+    if (!consistency.consistent) {
+      return {
+        snapshot: null,
+        state: "snapshot-inconsistent",
+        cacheKey: "snapshot-inconsistent",
+      };
+    }
+  } else if (pendingWork > 0) {
+    // A legacy snapshot has no way to prove that its pending work is only
+    // background protocol activity, so keep the previous fail-closed behavior.
     return { snapshot: null, state: "pending-work", cacheKey: "pending-work" };
   }
   const sourceState = timestampFreshness(
@@ -1342,6 +1406,20 @@ async function main() {
     writing = true;
     try {
       const snapshot = await cdp.evaluate(browserGetSnapshotSource, contextId);
+      // Publish the small, freshness-critical reference snapshots before the
+      // expensive bookmaker matching and surebet rendering. Their generatedAt
+      // timestamp now reflects the time the browser snapshot was read, not the
+      // end of a potentially multi-second render cycle.
+      await Promise.all([
+        writeAtomically(
+          CONFIG.watchlistFile,
+          `${JSON.stringify(createWatchlist(snapshot), null, 2)}\n`,
+        ),
+        writeAtomically(
+          CONFIG.statusSnapshotFile,
+          `${JSON.stringify(createStatusSnapshot(snapshot))}\n`,
+        ),
+      ]);
       await refreshTeamAliases();
       const now = Date.now();
       const liveMarkets = snapshot.markets.filter(market => market.inPlay === true);
@@ -1449,14 +1527,6 @@ async function main() {
         surebetEvents:
           liveSurebets.surebetEvents + prematchCache.surebets.surebetEvents,
       };
-      await writeAtomically(
-        CONFIG.watchlistFile,
-        `${JSON.stringify(createWatchlist(snapshot), null, 2)}\n`,
-      );
-      await writeAtomically(
-        CONFIG.statusSnapshotFile,
-        `${JSON.stringify(createStatusSnapshot(snapshot))}\n`,
-      );
       await writeAtomically(CONFIG.outputFile, rendered.content);
       await writeAtomically(CONFIG.surebetsOutputFile, surebets.content);
       const status =
