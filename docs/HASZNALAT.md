@@ -20,6 +20,167 @@ Set-Location 'C:\Users\regai\Projects\OddsAggregator'
 & .\bin\start_stack.ps1
 ```
 
+## Headless elsődleges üzemeltetés
+
+Ha a headless mód az éles, kanonikus kimeneteket író üzemmód, használd az
+egységes vezérlőscriptet. Saját Chrome-profilt és alapértelmezetten a `9333`
+CDP-portot használja, de a normál, cím nélküli Node monitorok mellett nem indul
+el: azok ugyanezeket a `data\` kimeneteket írnák.
+
+```powershell
+# Indítás (a normál monitorok előbb legyenek leállítva)
+& .\bin\headless_primary.ps1 Start
+
+# Egyszeri állapotjelentés: Chrome/CDP, oldalak, monitorok, kimenetek frissessége
+& .\bin\headless_primary.ps1 Status
+
+# Folyamatos, kétmásodperces állapotnézet; kilépés: Ctrl+C
+& .\bin\headless_primary.ps1 Watch
+
+# Csak a headless primary Node monitorokat és a saját Chrome-példányát állítja le
+& .\bin\headless_primary.ps1 Stop
+
+# Célzott újraindítás
+& .\bin\headless_primary.ps1 Restart
+```
+
+Az indítás a Surebet Managert is elindítja, ha még nem fut. Ennek kihagyására:
+
+```powershell
+& .\bin\headless_primary.ps1 Start -SkipManager
+```
+
+A production monitorok ugyanarra a kanonikus kimenetre második writert nem
+engednek. A SharpX csak friss, egészséges TippmixPro/Vegas snapshotból készít
+bookmaker-sort vagy surebetet; elavult, disconnectelt, jövőbeli időbélyegű vagy
+élő/prematch fázisban eltérő adat fail-closed módon kimarad.
+
+## Headless Chrome A/B teszt
+
+A normál stack megváltoztatása nélkül, külön Chrome-profillal, CDP-porttal,
+kimeneti fájlokkal és naplókkal indítható:
+
+```powershell
+& .\bin\start_headless_ab_test.ps1
+& .\bin\measure_headless_ab_test.ps1 -DurationSeconds 900
+```
+
+Az A/B teszt alapértelmezetten a `9333` CDP-portot, a
+`data\ab-headless\` kimeneti mappát és a `logs\ab-headless\` naplókat használja.
+A headless primary ugyanezt a portot használja, ezért párhuzamos teszthez adj meg
+szabad `-CdpPort` értéket.
+A mérőszkript öt másodpercenként rögzíti a headless Chrome és a teszt-monitorok
+memóriáját, összes CPU-idejét, valamint a négy fontos kimenet frissességét.
+Értékeléskor a Chrome working setet, az 1–2 másodperc körüli fájlfrissességet és
+a `*.error.log` fájlok új hibáit kell összevetni a normál stackkel.
+
+## Háromforrásos, Chrome-mentes shadow teszt
+
+A SharpX, Vegas és TippmixPro közvetlen Node-os collectora külön futtatható,
+anélkül hogy az éles headless kimeneteket írná. A futtató forrásonként külön
+snapshotot és összevetési naplót hoz létre; a folyamatok a megadott idő végén
+maguktól leállnak.
+
+```powershell
+& .\bin\start_all_direct_shadow_test.ps1 -DurationHours 2
+```
+
+A SharpX összevető a piacállapotot, a katalógusfrissítés idejét és a nyers
+áridőbélyeget is figyelembe veszi. A Vegas és TippmixPro összevetője a
+`generatedAt`- és forrásfrissesség, eseményfedettség és snapshot-skew mellett az
+odds-, státusz-, live- és kezdésiidő-egyezést is méri. A közös launcher a Vegas
+watchlistet a direct SharpX snapshotból építi, így a három collector
+forrásoldalon Chrome nélkül fut; kanonikus combined/surebet kimenetet továbbra
+sem ír.
+
+Induláskor a launcher legfeljebb 60 másodpercig vár mindhárom friss, olvasható
+JSON-ra. Startup hiba esetén csak az adott GUID-os run PID-jeit és konténereit
+takarítja; a `logs\all-direct-shadow\<runId>\run-manifest.json` tartalmazza a
+deadline-t és az elindított erőforrásokat.
+
+Az odds-időbélyeg toleranciája prematchnél 3 másodperc, élő piacnál 10 másodperc;
+ez az élő oddsok természetes frissítési eltolódását kezeli.
+
+A SharpX comparator csak összehasonlítható snapshotpárt számol bele az eltérés- és
+evidence-metrikákba. A freshness alapja a JSON `generatedAt` mezője, nem a fájl
+módosítási ideje. Az alapértelmezett kapuk: 30 másodperc warmup, legfeljebb
+10 másodperces normál és 5 másodperces direct tartalomkor, legfeljebb 5
+másodperces snapshot-időkülönbség, valamint mindkét oldalon legalább 95%-os
+`initializedMarkets / subscribedMarkets` lefedettség. Érvénytelen minta minden
+folyamatban lévő evidence-epizódot megszakít. A snapshot `markets` tömbje és az
+`initializedMarkets` számláló is sémaellenőrzést kap; hibás vagy ellentmondó
+snapshot nem kerül összehasonlításra. A mintavételben alapértelmezetten 5
+másodpercnél hosszabb kihagyás újraindítja az evidence grace időt. A fő
+felülírások:
+`--warmup-ms`, `--normal-max-content-age-ms`, `--direct-max-content-age-ms`,
+`--max-snapshot-skew-ms`, `--max-observation-gap-ms` és
+`--min-coverage-ratio`.
+
+A SharpX direct collector a socket-tömörítést óvatosan végzi: alapértelmezetten
+három egymást követő katalógusciklusban fennálló alulterheltség után indítja el,
+majd két tömörítés között legalább 5 percet vár. A viselkedés a
+`--socket-compaction-confirmations` és `--socket-compaction-ms` kapcsolókkal
+hangolható.
+
+A dinamikus, lapozott SharpX-katalógusból egy piac csak három egymást követő,
+sikeres frissítési körös hiány után kerül ki; ezt a
+`--catalogue-absence-confirmations` módosítja. A recovery az aktuális owner
+socket `OPEN`/`ready` állapotát és az ár generációját is ellenőrzi. A nem-ready
+vagy stale piacokat először újra feliratkoztatja, ismételt sikertelenségnél pedig
+csak az érintett socketet indítja újra. Az age-alapú stale-határ csak élő,
+`OPEN` piacnál aktív, alapértéke 60 másodperc. Prematch piacnál alapértelmezés
+szerint ki van kapcsolva, mert a SharpX stream eseményvezérelt; a socket teljes
+frissességét ettől függetlenül a frame-idő figyeli. A market-triggered restartok
+száma ciklusonként legfeljebb 2, és socketenként 2 percről legfeljebb 15 percre
+növekvő cooldown védi a collectort a restart-hullámtól.
+
+A `sharpx_status_snapshot.json` `marketDiagnostics` blokkja okonkénti számlálót
+és korlátozott ID-listát ír a `catalogue-missing`, `hysteresis-retained`,
+`not-ready`, `stale` és `closed` állapotokról. Ugyanitt látható a nyers/egyedi/
+duplikált katalógusméret, valamint a socket close/reconnect és market-recovery
+számláló is. A lezárt piac az aktív kimenetből azonnal kiesik, diagnosztikai
+rekordja alapértelmezetten még 5 percig megmarad.
+
+Tiszta A/B erőforrásmérésnél a két stack nem futhat egyidejűleg. A
+`run_clean_resource_ab_test.ps1` a már elindított normál baseline-mérés befejezése
+után automatikusan leállítja a normál stacket, elvégzi az izolált headless mérést,
+majd visszaállítja a normál Chrome-ot, monitorokat és a Surebet Managert.
+
+## 24 órás headless shadow stabilitási teszt
+
+A normál stack marad az éles kimeneti forrás; a headless stack külön profillal,
+alapból `9334` CDP-porttal és futásonként elkülönített mappákban dolgozik. Az összehasonlító
+másodpercenként figyeli a kimeneteket. A bizonyítékcsomag csak legalább 30
+másodpercig fennálló, legalább 0,5% nettó edge-ű,
+esemény/bookmaker/1X2-kimenet szintű surebet-eltéréshez készül.
+
+```powershell
+& .\bin\start_shadow_stability_test.ps1 -DurationHours 24
+```
+
+A futás végén a headless Chrome és monitorai automatikusan leállnak. A futáshoz
+tartozó `logs\shadow-stability\<id>\summary.json` és `report.md` összegzi a
+frissességi hibákat, hibanapló-növekedéseket, snapshot-eltéréseket és a normál-only/
+headless-only surebet epizódokat. A jelentős eltérésekhez tartozó `evidence\*.json`
+fájlok a két oldal aktuális oddsait, fájlkorát és eseményállapotát is elmentik.
+Az `surebetPresent` és `missingFrom` mezők egyértelműen jelzik, melyik oldalon
+volt jelen, illetve hiányzott a surebet; a státusz-összevetés ettől függetlenül
+mindkét oldalon ugyanarra az eseményre történik.
+Mindkét oldalon szerepel egy `sharpXQuote` blokk is: a SharpX 1/X/2 best-lay
+oddsokkal, azok `oddsUpdatedAt` forrásidejével és a státuszsnapshot
+`statusSnapshotGeneratedAt` idejével.
+A SharpX állapotokat a `data\sharpx_status_snapshot.json` tartalmazza. A részletes
+`health.jsonl` és `events.jsonl` csak diagnosztikához szükséges, nem az éles
+kimeneteket módosítja.
+
+Élő összevetéshez minden shadow run a saját
+`data\shadow-headless\<id>\football\surebets_live_odds.txt` fájlját használja; a
+normál fájl továbbra is `data\football\surebets_live_odds.txt`. A
+`bin\watch_shadow_surebets.ps1` automatikusan a legutóbbi run fájlját választja,
+vagy a `-HeadlessFile` kapcsolóval explicit útvonal adható. Mivel a monitorok
+atomikusan cserélik a fájlokat, a `Get-Content -Wait` nem követi megbízhatóan a
+változásokat.
+
 A szkript szükség esetén elindítja a proxyt használó, `9222`-es CDP-portú
 Chrome-ot, megnyitja a három szükséges sportoldalt, elindítja a Surebet Manager
 GUI-t, majd háttérben a TippmixPro, SharpX és Vegas monitorokat. A már futó
@@ -154,6 +315,12 @@ Surebet lista:
 
 ```powershell
 Get-Content .\data\football\surebets_live_odds.txt -Encoding utf8 -Wait
+```
+
+Normál és headless lista élő összevetése:
+
+```powershell
+& .\bin\watch_shadow_surebets.ps1
 ```
 
 Hibák:

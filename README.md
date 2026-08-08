@@ -24,8 +24,13 @@ Fő kimenetek:
 - `data/combined_odds.txt`
 - `data/football/surebets_live_odds.txt`
 
-Teljes stack indítása:
+Ajánlott production indítás (headless primary):
 
 ```powershell
-& .\bin\start_stack.ps1
+& .\bin\headless_primary.ps1 Start
+& .\bin\headless_primary.ps1 Status
 ```
+
+A látható Chrome-os rollback/referencia stack: `bin\start_stack.ps1`.
+
+Az aktuális priorizált technikai audit: [Projekt-review – 2026-08-07](docs/REVIEW_2026-08-07.md).
