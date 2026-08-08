@@ -519,6 +519,7 @@ A forráskód CDP-alapértéke `9222`; a `headless_primary.ps1` induláskor mind
 | `VEGAS_MATCHED_REFRESH_MS` | `5000` |
 | `VEGAS_CATALOGUE_REFRESH_MS` | `300000` |
 | `VEGAS_REQUEST_TIMEOUT_MS` | `15000` |
+| `VEGAS_LIVE_REQUEST_TIMEOUT_MS` | `4000` |
 | `VEGAS_TIMEZONE_OFFSET_MINUTES` | nincs; runtime időzóna |
 | `SHARPX_OUTPUT_FILE` | `data\combined_odds.txt` |
 | `SUREBETS_OUTPUT_FILE` | `data\football\surebets_live_odds.txt` |
@@ -560,6 +561,61 @@ A direct SharpX és comparator részletes CLI-alapértékei a fájlok elején l�
 | `docs\` | Használat, handoff és technikai jegyzetek |
 | `..\SurebetManager\` | Külső testvérprojekt, `main_qt.py` GUI |
 | `/home/jimmy/pia-vpn` | Külső WSL PIA/Gluetun konfiguráció |
+
+## Session handoff – 2026-08-08
+
+The latest implementation is in commits `d26ff3f` and `a8fed29`.
+
+Implemented since the previous audit:
+
+- SharpX subscription transitions retain the last complete price set within
+  the fallback age window; freshness-critical watchlist/status publication is
+  written before the expensive render phase.
+- TippmixPro keeps the last complete event metadata when a WAMP MATCH update
+  temporarily omits `startTime` or status. The snapshot exposes optional
+  `snapshotConsistency.recoveredEvents`; genuinely incomplete events without a
+  previous complete record still fail closed.
+- Vegas uses `VEGAS_LIVE_REQUEST_TIMEOUT_MS=4000` for fast live retries while
+  catalogue/detail requests retain the 15-second generic timeout.
+- `start_all_direct_shadow_test.ps1` and
+  `start_sharpx_direct_shadow_test.ps1` remain watchdogs until the shared
+  deadline, then clean only their own resources and write `completedAt` and
+  `cleanupCompletedAt` into `run-manifest.json`.
+
+Validation:
+
+- `node --test`: 49/49 passed;
+- both direct launcher scripts parse cleanly in Windows PowerShell 5.1;
+- latest 15-minute three-source smoke:
+  `20260808-091257-239-5119ee1a`;
+- smoke manifest reached `status: completed`; all six tracked processes and
+  all three run containers were gone after cleanup; the pre-existing headless
+  reference stack remained running.
+
+Latest smoke metrics:
+
+- SharpX: 670/825 eligible samples (81.21%), final coverage 778/783 markets,
+  `persistentPresenceEvidence=0`, `persistentOddsEvidence=0`; invalid samples
+  were snapshot-skew only.
+- Vegas: 816/831 eligible samples (98.19%), 99.835% odds agreement on
+  562,342 common-event observations; invalid samples were short live-refresh
+  freshness windows.
+- TippmixPro: 814/814 eligible samples (100%), no invalid samples and no
+  pending-work or snapshot-consistency rejections; 99.95% odds agreement on
+  1,337,979 common-event observations.
+
+Recommended next validation is a 2-hour PIA-Docker smoke before an 8-hour
+soak. The 15-minute run is not a release-acceptance result because SharpX
+snapshot-pair readiness was 81.21%, below the historical ~95% target, even
+though no persistent coverage evidence appeared. Start with:
+
+```powershell
+& .\bin\start_all_direct_shadow_test.ps1 -DurationMinutes 120
+```
+
+At the end, require `status: completed`, zero comparator/collector stderr,
+zero persistent SharpX presence/odds evidence, and investigate any continued
+SharpX `snapshot-skew-high` rate before spending eight hours on a soak run.
 
 ## Git/worktree állapot
 
