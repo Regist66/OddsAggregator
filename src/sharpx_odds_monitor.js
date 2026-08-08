@@ -2,6 +2,8 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { acquireWriterLocks, writeTextAtomically } from "./atomic_file.js";
+import { envNumber } from "./numeric_config.js";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(SCRIPT_DIR, "..");
@@ -26,17 +28,65 @@ const CONFIG = {
   watchlistFile:
     process.env.SHARPX_WATCHLIST_FILE ??
     path.join(DATA_DIR, "sharpx_watchlist.json"),
+  statusSnapshotFile:
+    process.env.SHARPX_STATUS_SNAPSHOT_FILE ??
+    path.join(DATA_DIR, "sharpx_status_snapshot.json"),
   teamAliasesFile:
     process.env.TEAM_ALIASES_FILE ?? path.join(CONFIG_DIR, "team_aliases.json"),
-  prematchMinimumMatched: Number(
-    process.env.SHARPX_PREMATCH_MIN_MATCHED ?? 300,
-  ),
-  catalogueRefreshMs: Number(
-    process.env.SHARPX_CATALOGUE_REFRESH_MS ?? 60_000,
-  ),
-  outputIntervalMs: Number(process.env.SHARPX_OUTPUT_INTERVAL_MS ?? 1_000),
-  prematchRenderMs: Number(process.env.SHARPX_PREMATCH_RENDER_MS ?? 5_000),
-  marketsPerSocket: Number(process.env.SHARPX_MARKETS_PER_SOCKET ?? 30),
+  prematchMinimumMatched: envNumber("SHARPX_PREMATCH_MIN_MATCHED", 300, {
+    min: 0,
+  }),
+  catalogueRefreshMs: envNumber("SHARPX_CATALOGUE_REFRESH_MS", 60_000, {
+    integer: true,
+    min: 1_000,
+  }),
+  outputIntervalMs: envNumber("SHARPX_OUTPUT_INTERVAL_MS", 1_000, {
+    integer: true,
+    min: 100,
+  }),
+  prematchRenderMs: envNumber("SHARPX_PREMATCH_RENDER_MS", 5_000, {
+    integer: true,
+    min: 100,
+  }),
+  marketsPerSocket: envNumber("SHARPX_MARKETS_PER_SOCKET", 30, {
+    integer: true,
+    min: 1,
+    max: 200,
+  }),
+  livePriceMaxAgeMs: envNumber("SHARPX_LIVE_PRICE_MAX_AGE_MS", 10_000, {
+    integer: true,
+    min: 1_000,
+  }),
+  bookmakerSnapshotMaxAgeMs: envNumber("BOOKMAKER_SNAPSHOT_MAX_AGE_MS", 10_000, {
+    integer: true,
+    min: 1_000,
+  }),
+  snapshotFutureToleranceMs: envNumber("SNAPSHOT_FUTURE_TOLERANCE_MS", 5_000, {
+    integer: true,
+    min: 0,
+  }),
+  tippmixSourceMaxAgeMs: envNumber("TIPPMIXPRO_SOURCE_MAX_AGE_MS", 30_000, {
+    integer: true,
+    min: 1_000,
+  }),
+  vegasSourceMaxAgeMs: envNumber("VEGAS_SOURCE_MAX_AGE_MS", 10_000, {
+    integer: true,
+    min: 1_000,
+  }),
+  vegasEventMaxAgeMs: envNumber("VEGAS_EVENT_MAX_AGE_MS", 15_000, {
+    integer: true,
+    min: 1_000,
+  }),
+  cdpCommandTimeoutMs: envNumber("CDP_COMMAND_TIMEOUT_MS", 15_000, {
+    integer: true,
+    min: 1_000,
+    max: 120_000,
+  }),
+  fetchTimeoutMs: envNumber("SHARPX_FETCH_TIMEOUT_MS", 15_000, {
+    integer: true,
+    min: 1_000,
+    max: 120_000,
+  }),
   once: process.env.SHARPX_ONCE === "1",
 };
 
@@ -60,8 +110,21 @@ class CdpClient {
     this.socket = new WebSocket(this.webSocketUrl);
 
     await new Promise((resolve, reject) => {
-      const onError = () => reject(new Error("Nem sikerült kapcsolódni a CDP WebSockethez."));
-      this.socket.addEventListener("open", resolve, { once: true });
+      const timeout = setTimeout(
+        () => {
+          reject(new Error("SharpX CDP kapcsolódási időtúllépés."));
+          this.socket?.close();
+        },
+        CONFIG.cdpCommandTimeoutMs,
+      );
+      const onError = () => {
+        clearTimeout(timeout);
+        reject(new Error("Nem sikerült kapcsolódni a CDP WebSockethez."));
+      };
+      this.socket.addEventListener("open", () => {
+        clearTimeout(timeout);
+        resolve();
+      }, { once: true });
       this.socket.addEventListener("error", onError, { once: true });
     });
 
@@ -77,7 +140,11 @@ class CdpClient {
 
     const id = ++this.nextId;
     const result = new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        reject(new Error(`SharpX CDP parancs időtúllépés: ${method}`));
+      }, CONFIG.cdpCommandTimeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
     });
 
     this.socket.send(JSON.stringify({ id, method, params }));
@@ -122,6 +189,11 @@ class CdpClient {
 
   close() {
     this.closed = true;
+    for (const { reject, timer } of this.pending.values()) {
+      clearTimeout(timer);
+      reject(new Error("A CDP kapcsolat lezárult."));
+    }
+    this.pending.clear();
     this.socket?.close();
   }
 
@@ -131,6 +203,7 @@ class CdpClient {
     if (message.id && this.pending.has(message.id)) {
       const pending = this.pending.get(message.id);
       this.pending.delete(message.id);
+      clearTimeout(pending.timer);
 
       if (message.error) pending.reject(new Error(JSON.stringify(message.error)));
       else pending.resolve(message.result);
@@ -156,7 +229,8 @@ class CdpClient {
   #onClose() {
     if (this.closed) return;
 
-    for (const { reject } of this.pending.values()) {
+    for (const { reject, timer } of this.pending.values()) {
+      clearTimeout(timer);
       reject(new Error("A CDP kapcsolat váratlanul megszakadt."));
     }
     this.pending.clear();
@@ -164,7 +238,9 @@ class CdpClient {
 }
 
 async function findSharpXTarget() {
-  const response = await fetch(`${CONFIG.cdpEndpoint}/json`);
+  const response = await fetch(`${CONFIG.cdpEndpoint}/json`, {
+    signal: AbortSignal.timeout(CONFIG.cdpCommandTimeoutMs),
+  });
   if (!response.ok) {
     throw new Error(`A CDP targetlista nem kérhető le: HTTP ${response.status}`);
   }
@@ -186,10 +262,12 @@ async function findSharpXTarget() {
   return target;
 }
 
-function browserCollectorSource() {
+export function browserCollectorSource() {
   const options = JSON.stringify({
     prematchMinimumMatched: CONFIG.prematchMinimumMatched,
     marketsPerSocket: CONFIG.marketsPerSocket,
+    livePriceMaxAgeMs: CONFIG.livePriceMaxAgeMs,
+    fetchTimeoutMs: CONFIG.fetchTimeoutMs,
   });
 
   return `(() => {
@@ -197,6 +275,23 @@ function browserCollectorSource() {
     const options = ${options};
 
     globalThis.__sharpXMatchOddsCollector?.shutdown?.();
+
+    const fetchCataloguePage = async (page, requestBody) => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), options.fetchTimeoutMs);
+      try {
+        const response = await fetch("/customer/api/sport/details?page=" + page, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(requestBody),
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error("Catalogue HTTP " + response.status);
+        return await response.json();
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
 
     const collector = {
       version: VERSION,
@@ -217,14 +312,7 @@ function browserCollectorSource() {
           contextFilter: "EVENT_TYPE",
         };
 
-        const firstResponse = await fetch("/customer/api/sport/details?page=0", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(requestBody),
-        });
-        if (!firstResponse.ok) throw new Error("Catalogue HTTP " + firstResponse.status);
-
-        const firstPage = await firstResponse.json();
+        const firstPage = await fetchCataloguePage(0, requestBody);
         const pageCount = firstPage.marketCatalogueList.totalPages;
         const pages = [firstPage];
 
@@ -234,15 +322,7 @@ function browserCollectorSource() {
             (_, index) => start + index,
           );
           const batch = await Promise.all(
-            pageNumbers.map(async page => {
-              const response = await fetch("/customer/api/sport/details?page=" + page, {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify(requestBody),
-              });
-              if (!response.ok) throw new Error("Catalogue HTTP " + response.status);
-              return response.json();
-            }),
+            pageNumbers.map(page => fetchCataloguePage(page, requestBody)),
           );
           pages.push(...batch);
         }
@@ -363,13 +443,22 @@ function browserCollectorSource() {
                   continue;
                 }
 
+                const status = update.marketDefinition?.status;
+                const receivedAt = Date.now();
                 this.prices.set(update.id, {
                   ...previous,
                   ...update,
                   marketDefinition:
                     update.marketDefinition ?? previous?.marketDefinition,
-                  rc: update.rc ?? previous?.rc ?? [],
-                  receivedAt: Date.now(),
+                  // A suspension invalidates the previous executable prices.
+                  // A later OPEN definition without a new rc must not revive them.
+                  rc:
+                    update.rc ??
+                    (status && status !== "OPEN" ? [] : previous?.rc ?? []),
+                  receivedAt,
+                  oddsReceivedAt: Array.isArray(update.rc)
+                    ? receivedAt
+                    : previous?.oddsReceivedAt ?? null,
                   generation,
                 });
                 connection.readyMarkets.add(update.id);
@@ -395,6 +484,7 @@ function browserCollectorSource() {
       },
 
       getSnapshot() {
+        const now = Date.now();
         const selectedIds = new Set(
           this.subscriptionSignature ? this.subscriptionSignature.split(",") : [],
         );
@@ -421,6 +511,7 @@ function browserCollectorSource() {
               totalMatched: Number(price.tv ?? catalogue.totalMatched ?? 0),
               apiPt: price.apiPt ?? null,
               receivedAt: price.receivedAt,
+              oddsReceivedAt: price.oddsReceivedAt ?? null,
               runnerPrices: (price.rc ?? []).map(runner => ({
                 selectionId: Number(runner.id),
                 bestLay: runner.bdatl?.[0] ?? null,
@@ -428,11 +519,24 @@ function browserCollectorSource() {
             };
           })
           .filter(Boolean)
-          .filter(market => market.status !== "CLOSED")
+          .filter(market => market.status === "OPEN")
+          .filter(
+            market =>
+              market.runnerPrices.filter(
+                runner => Number.isFinite(Number(runner.bestLay)) && Number(runner.bestLay) > 1,
+              ).length >= 1,
+          )
+          .filter(
+            market =>
+              market.inPlay !== true ||
+              (Number.isFinite(Number(market.oddsReceivedAt)) &&
+                now - Number(market.oddsReceivedAt) <= options.livePriceMaxAgeMs &&
+                now - Number(market.oddsReceivedAt) >= -5_000),
+          )
           .sort((left, right) => right.totalMatched - left.totalMatched);
 
         return {
-          generatedAt: Date.now(),
+          generatedAt: now,
           generation: this.generation,
           subscribedMarkets: selectedIds.size,
           initializedMarkets: markets.length,
@@ -725,6 +829,14 @@ function findTippmixProEvent(market, tippmixEvents) {
   return strongEnough && total - nextTotal >= 0.12 ? fallback.event : null;
 }
 
+export function sameEventPhase(market, event, liveProperty) {
+  if (
+    typeof market?.inPlay !== "boolean" ||
+    typeof event?.[liveProperty] !== "boolean"
+  ) return false;
+  return market.inPlay === event[liveProperty];
+}
+
 function renderSummary(snapshot, tippmixSnapshot, vegasSnapshot) {
   const lines = [`*** ${formatTimestamp(snapshot.generatedAt)} ***`, ""];
   const tippmixEvents = Array.isArray(tippmixSnapshot?.events)
@@ -758,7 +870,7 @@ function renderSummary(snapshot, tippmixSnapshot, vegasSnapshot) {
       market,
       timeCandidates(tippmixTimeIndex, market.marketStartTime),
     );
-    if (tippmixEvent) {
+    if (tippmixEvent && sameEventPhase(market, tippmixEvent, "inPlay")) {
       const hasSeparatedOdds =
         Object.hasOwn(tippmixEvent, "regularOdds") ||
         Object.hasOwn(tippmixEvent, "superOdds");
@@ -790,14 +902,15 @@ function renderSummary(snapshot, tippmixSnapshot, vegasSnapshot) {
       market,
       timeCandidates(vegasTimeIndex, market.marketStartTime),
     );
-    if (Array.isArray(vegasEvent?.odds)) {
+    const vegasPhaseMatches = sameEventPhase(market, vegasEvent, "live");
+    if (vegasPhaseMatches && Array.isArray(vegasEvent?.odds)) {
       const [vegasHome, vegasDraw, vegasAway] = vegasEvent.odds.map(formatOdds);
       lines.push(
         `${"Vegas".padEnd(22)}${vegasHome.padEnd(10)}${vegasDraw.padEnd(10)}${vegasAway}`,
       );
       vegasMatches += 1;
     }
-    if (Array.isArray(vegasEvent?.enhancedOdds)) {
+    if (vegasPhaseMatches && Array.isArray(vegasEvent?.enhancedOdds)) {
       const [enhancedHome, enhancedDraw, enhancedAway] =
         vegasEvent.enhancedOdds.map(formatOdds);
       lines.push(
@@ -859,7 +972,7 @@ function renderSurebets(snapshot, tippmixSnapshot, vegasSnapshot) {
       market,
       timeCandidates(tippmixTimeIndex, market.marketStartTime),
     );
-    if (tippmixEvent) {
+    if (tippmixEvent && sameEventPhase(market, tippmixEvent, "inPlay")) {
       const hasSeparatedOdds =
         Object.hasOwn(tippmixEvent, "regularOdds") ||
         Object.hasOwn(tippmixEvent, "superOdds");
@@ -885,10 +998,11 @@ function renderSurebets(snapshot, tippmixSnapshot, vegasSnapshot) {
       market,
       timeCandidates(vegasTimeIndex, market.marketStartTime),
     );
-    if (Array.isArray(vegasEvent?.odds)) {
+    const vegasPhaseMatches = sameEventPhase(market, vegasEvent, "live");
+    if (vegasPhaseMatches && Array.isArray(vegasEvent?.odds)) {
       bookmakerRows.push({ label: "Vegas", odds: vegasEvent.odds });
     }
-    if (Array.isArray(vegasEvent?.enhancedOdds)) {
+    if (vegasPhaseMatches && Array.isArray(vegasEvent?.enhancedOdds)) {
       bookmakerRows.push({ label: "Vegas**", odds: vegasEvent.enhancedOdds });
     }
 
@@ -932,11 +1046,129 @@ function composeRenderedOutput(header, ...contents) {
 
 async function readJsonSnapshot(filename) {
   try {
-    return JSON.parse(await fs.readFile(filename, "utf8"));
+    return { snapshot: JSON.parse(await fs.readFile(filename, "utf8")), error: null };
   } catch (error) {
-    if (error.code === "ENOENT") return null;
-    throw error;
+    return { snapshot: null, error: error.code ?? error.message };
   }
+}
+
+function timestampFreshness(value, now, maxAgeMs, futureToleranceMs) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return "timestamp-missing";
+  const ageMs = now - timestamp;
+  if (ageMs > maxAgeMs) return "stale";
+  if (ageMs < -futureToleranceMs) return "future-timestamp";
+  return "fresh";
+}
+
+function hasUsableOdds(values) {
+  return Array.isArray(values) && values.some(value => Number(value) > 1);
+}
+
+export function assessTippmixSnapshot(snapshot, options = {}) {
+  const now = options.now ?? Date.now();
+  const maxAgeMs = options.maxAgeMs ?? CONFIG.bookmakerSnapshotMaxAgeMs;
+  const sourceMaxAgeMs = options.sourceMaxAgeMs ?? CONFIG.tippmixSourceMaxAgeMs;
+  const futureToleranceMs =
+    options.futureToleranceMs ?? CONFIG.snapshotFutureToleranceMs;
+  if (!snapshot || typeof snapshot !== "object" || !Array.isArray(snapshot.events)) {
+    return { snapshot: null, state: "missing-or-invalid", cacheKey: "invalid" };
+  }
+  const snapshotState = timestampFreshness(
+    snapshot.generatedAt,
+    now,
+    maxAgeMs,
+    futureToleranceMs,
+  );
+  if (snapshotState !== "fresh") {
+    return { snapshot: null, state: `snapshot-${snapshotState}`, cacheKey: snapshotState };
+  }
+  if (snapshot.connected !== true) {
+    return { snapshot: null, state: "disconnected", cacheKey: "disconnected" };
+  }
+  const pendingWork = Number(snapshot.pendingWork);
+  if (!Number.isFinite(pendingWork) || pendingWork < 0) {
+    return { snapshot: null, state: "health-invalid", cacheKey: "health-invalid" };
+  }
+  if (pendingWork > 0) {
+    return { snapshot: null, state: "pending-work", cacheKey: "pending-work" };
+  }
+  const sourceState = timestampFreshness(
+    snapshot.lastFrameAt,
+    now,
+    sourceMaxAgeMs,
+    futureToleranceMs,
+  );
+  if (sourceState !== "fresh") {
+    return { snapshot: null, state: `source-${sourceState}`, cacheKey: sourceState };
+  }
+  return { snapshot, state: "fresh", cacheKey: "fresh" };
+}
+
+export function assessVegasSnapshot(snapshot, options = {}) {
+  const now = options.now ?? Date.now();
+  const maxAgeMs = options.maxAgeMs ?? CONFIG.bookmakerSnapshotMaxAgeMs;
+  const sourceMaxAgeMs = options.sourceMaxAgeMs ?? CONFIG.vegasSourceMaxAgeMs;
+  const eventMaxAgeMs = options.eventMaxAgeMs ?? CONFIG.vegasEventMaxAgeMs;
+  const futureToleranceMs =
+    options.futureToleranceMs ?? CONFIG.snapshotFutureToleranceMs;
+  if (!snapshot || typeof snapshot !== "object" || !Array.isArray(snapshot.events)) {
+    return { snapshot: null, state: "missing-or-invalid", cacheKey: "invalid" };
+  }
+  const snapshotState = timestampFreshness(
+    snapshot.generatedAt,
+    now,
+    maxAgeMs,
+    futureToleranceMs,
+  );
+  if (snapshotState !== "fresh") {
+    return { snapshot: null, state: `snapshot-${snapshotState}`, cacheKey: snapshotState };
+  }
+  const sourceState = timestampFreshness(
+    snapshot.lastLiveRefreshAt,
+    now,
+    sourceMaxAgeMs,
+    futureToleranceMs,
+  );
+  if (sourceState !== "fresh") {
+    return { snapshot: null, state: `source-${sourceState}`, cacheKey: sourceState };
+  }
+
+  const events = snapshot.events
+    .map(event => {
+      if (!event || typeof event !== "object") return null;
+      const normalFresh =
+        timestampFreshness(
+          event.updatedAt,
+          now,
+          eventMaxAgeMs,
+          futureToleranceMs,
+        ) === "fresh";
+      const enhancedFresh =
+        timestampFreshness(
+          event.enhancedUpdatedAt,
+          now,
+          eventMaxAgeMs,
+          futureToleranceMs,
+        ) === "fresh";
+      const odds = normalFresh && hasUsableOdds(event.odds) ? event.odds : null;
+      const enhancedOdds =
+        enhancedFresh && hasUsableOdds(event.enhancedOdds)
+          ? event.enhancedOdds
+          : null;
+      return odds || enhancedOdds ? { ...event, odds, enhancedOdds } : null;
+    })
+    .filter(Boolean);
+  const cacheKey = events
+    .filter(event => event.live !== true)
+    .map(event => `${event.id}:${event.odds ? "n" : ""}${event.enhancedOdds ? "e" : ""}`)
+    .sort()
+    .join(",");
+  return {
+    snapshot: { ...snapshot, events },
+    state: "fresh",
+    cacheKey: `fresh:${cacheKey}`,
+  };
 }
 
 function createWatchlist(snapshot) {
@@ -960,31 +1192,82 @@ function createWatchlist(snapshot) {
   };
 }
 
-async function writeAtomically(filename, content) {
-  const temporaryFile = `${filename}.tmp`;
-  await fs.writeFile(temporaryFile, content, "utf8");
+function createStatusSnapshot(snapshot) {
+  return {
+    generatedAt: snapshot.generatedAt,
+    generation: snapshot.generation,
+    subscribedMarkets: snapshot.subscribedMarkets,
+    initializedMarkets: snapshot.initializedMarkets,
+    lastCatalogueRefreshAt: snapshot.lastCatalogueRefreshAt ?? null,
+    lastError: snapshot.lastError ?? null,
+    markets: snapshot.markets.map(market => {
+      const teams = market.runners.filter(
+        runner =>
+          runner.selectionId !== 58805 &&
+          !/(^|\s)draw($|\s)/i.test(runner.runnerName),
+      );
+      const oneXTwoLayOdds = orderedOneXTwo(market).map(value =>
+        Number.isFinite(Number(value)) ? Number(value) : null,
+      );
+      const oddsUpdatedAt =
+        Number(market.oddsReceivedAt ?? market.receivedAt ?? 0) || null;
+      return {
+        marketId: market.marketId,
+        eventId: market.eventId ?? null,
+        eventName: market.eventName,
+        competitionName: market.competitionName,
+        startTime: Number(market.marketStartTime),
+        homeName: teams[0]?.runnerName ?? "",
+        awayName: teams[1]?.runnerName ?? "",
+        inPlay: market.inPlay === true,
+        status: market.status ?? null,
+        betDelay: Number(market.betDelay ?? 0),
+        receivedAt: oddsUpdatedAt,
+        // The raw SharpX market price timestamp and 1/X/2 best-lay prices
+        // make shadow evidence auditable without storing the whole snapshot.
+        oddsUpdatedAt,
+        apiPt: Number(market.apiPt ?? 0) || null,
+        oneXTwoLayOdds,
+      };
+    }),
+  };
+}
 
-  try {
-    await fs.rename(temporaryFile, filename);
-  } catch (error) {
-    if (error.code !== "EEXIST" && error.code !== "EPERM") throw error;
-    await fs.rm(filename, { force: true });
-    await fs.rename(temporaryFile, filename);
-  }
+async function writeAtomically(filename, content) {
+  await writeTextAtomically(filename, content);
 }
 
 async function main() {
   await fs.mkdir(path.dirname(CONFIG.surebetsOutputFile), { recursive: true });
-  const target = await findSharpXTarget();
-  const cdp = new CdpClient(target.webSocketDebuggerUrl);
+  const writerLock = await acquireWriterLocks(
+    [
+      CONFIG.outputFile,
+      CONFIG.surebetsOutputFile,
+      CONFIG.watchlistFile,
+      CONFIG.statusSnapshotFile,
+    ],
+    "SharpX production monitor",
+  );
+  let cdp = null;
   let contextId;
   let catalogueTimer;
   let outputTimer;
   let stopping = false;
   let writing = false;
   let lastOutputStatus = "";
+  let lastBookmakerHealthStatus = "";
   let recoveryPromise = null;
   let prematchCache = null;
+
+  const connectCdp = async (force = false) => {
+    if (!force && cdp?.socket?.readyState === WebSocket.OPEN) return;
+    cdp?.close();
+    const target = await findSharpXTarget();
+    const nextClient = new CdpClient(target.webSocketDebuggerUrl);
+    await nextClient.connect();
+    cdp = nextClient;
+    contextId = undefined;
+  };
 
   const stop = async exitCode => {
     if (stopping) return;
@@ -993,19 +1276,20 @@ async function main() {
     clearInterval(outputTimer);
 
     try {
-      if (contextId) await cdp.evaluate(browserShutdownSource, contextId, false);
+      if (contextId && cdp) await cdp.evaluate(browserShutdownSource, contextId, false);
     } catch {
       // A böngésző vagy az iframe ekkor már bezáródhatott.
     }
 
-    cdp.close();
+    cdp?.close();
+    await writerLock.release();
     process.exitCode = exitCode;
   };
 
   process.once("SIGINT", () => void stop(0));
   process.once("SIGTERM", () => void stop(0));
 
-  await cdp.connect();
+  await connectCdp();
 
   const recoverCollector = () => {
     if (recoveryPromise) return recoveryPromise;
@@ -1013,6 +1297,9 @@ async function main() {
       let lastError;
       for (let attempt = 0; attempt < 20 && !stopping; attempt += 1) {
         try {
+          if (attempt > 0 || cdp?.socket?.readyState !== WebSocket.OPEN) {
+            await connectCdp(attempt > 0);
+          }
           contextId = await cdp.waitForPortalContext();
           await cdp.evaluate(browserCollectorSource(), contextId);
           const result = await cdp.evaluate(browserRefreshCatalogueSource, contextId);
@@ -1041,7 +1328,12 @@ async function main() {
       );
     } catch (error) {
       console.error(`[catalogue] ${error.message}`);
-      await recoverCollector();
+      try {
+        await recoverCollector();
+      } catch (recoveryError) {
+        console.error(`[recovery] ${recoveryError.message}`);
+        await stop(1);
+      }
     }
   };
 
@@ -1053,17 +1345,48 @@ async function main() {
       await refreshTeamAliases();
       const now = Date.now();
       const liveMarkets = snapshot.markets.filter(market => market.inPlay === true);
-      const needsPrematchRefresh =
-        !prematchCache || now - prematchCache.updatedAt >= CONFIG.prematchRenderMs;
+      const liveSignature = liveMarkets
+        .map(market => market.marketId)
+        .sort()
+        .join(",");
 
       // Without live events the cached prematch output is intentionally refreshed only
       // at the configured prematch cadence. Live events always get a fresh cycle.
-      if (liveMarkets.length === 0 && !needsPrematchRefresh) return;
-
-      const [tippmixSnapshot, vegasSnapshot] = await Promise.all([
+      const [tippmixRead, vegasRead] = await Promise.all([
         readJsonSnapshot(CONFIG.tippmixProSnapshotFile),
         readJsonSnapshot(CONFIG.vegasSnapshotFile),
       ]);
+      const tippmixAssessment = tippmixRead.error
+        ? {
+            snapshot: null,
+            state: `read-${tippmixRead.error}`,
+            cacheKey: `read-${tippmixRead.error}`,
+          }
+        : assessTippmixSnapshot(tippmixRead.snapshot, { now });
+      const vegasAssessment = vegasRead.error
+        ? {
+            snapshot: null,
+            state: `read-${vegasRead.error}`,
+            cacheKey: `read-${vegasRead.error}`,
+          }
+        : assessVegasSnapshot(vegasRead.snapshot, { now });
+      const tippmixSnapshot = tippmixAssessment.snapshot;
+      const vegasSnapshot = vegasAssessment.snapshot;
+      const bookmakerCacheKey =
+        `${tippmixAssessment.cacheKey}|${vegasAssessment.cacheKey}`;
+      const bookmakerHealthStatus =
+        `TippmixPro=${tippmixAssessment.state}, Vegas=${vegasAssessment.state}`;
+      if (bookmakerHealthStatus !== lastBookmakerHealthStatus) {
+        lastBookmakerHealthStatus = bookmakerHealthStatus;
+        console.log(`[snapshot-health] ${bookmakerHealthStatus}`);
+      }
+      const needsPrematchRefresh =
+        !prematchCache ||
+        now - prematchCache.updatedAt >= CONFIG.prematchRenderMs ||
+        prematchCache.liveSignature !== liveSignature ||
+        prematchCache.bookmakerCacheKey !== bookmakerCacheKey;
+
+      if (liveMarkets.length === 0 && !needsPrematchRefresh) return;
 
       if (needsPrematchRefresh) {
         const visiblePrematchMarkets = snapshot.markets.filter(
@@ -1085,7 +1408,13 @@ async function main() {
           tippmixSnapshot,
           vegasSnapshot,
         );
-        prematchCache = { updatedAt: now, summary, surebets };
+        prematchCache = {
+          updatedAt: now,
+          liveSignature,
+          bookmakerCacheKey,
+          summary,
+          surebets,
+        };
       }
 
       const liveSummary = renderSummary(
@@ -1124,6 +1453,10 @@ async function main() {
         CONFIG.watchlistFile,
         `${JSON.stringify(createWatchlist(snapshot), null, 2)}\n`,
       );
+      await writeAtomically(
+        CONFIG.statusSnapshotFile,
+        `${JSON.stringify(createStatusSnapshot(snapshot))}\n`,
+      );
       await writeAtomically(CONFIG.outputFile, rendered.content);
       await writeAtomically(CONFIG.surebetsOutputFile, surebets.content);
       const status =
@@ -1137,7 +1470,14 @@ async function main() {
       }
     } catch (error) {
       console.error(`[output] ${error.message}`);
-      await recoverCollector();
+      if (!error?.isOutputError) {
+        try {
+          await recoverCollector();
+        } catch (recoveryError) {
+          console.error(`[recovery] ${recoveryError.message}`);
+          await stop(1);
+        }
+      }
     } finally {
       writing = false;
     }
@@ -1172,7 +1512,9 @@ async function main() {
   outputTimer = setInterval(() => void writeOutput(), CONFIG.outputIntervalMs);
 }
 
-main().catch(error => {
-  console.error(error.stack ?? error);
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch(error => {
+    console.error(error.stack ?? error);
+    process.exitCode = 1;
+  });
+}

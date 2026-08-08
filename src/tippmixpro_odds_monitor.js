@@ -2,6 +2,8 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { acquireWriterLock, writeTextAtomically } from "./atomic_file.js";
+import { envNumber } from "./numeric_config.js";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(SCRIPT_DIR, "..");
@@ -13,10 +15,19 @@ const CONFIG = {
   outputFile:
     process.env.TIPPMIXPRO_OUTPUT_FILE ??
     path.join(DATA_DIR, "tippmixpro_odds_snapshot.json"),
-  catalogueRefreshMs: Number(
-    process.env.TIPPMIXPRO_CATALOGUE_REFRESH_MS ?? 300_000,
-  ),
-  outputIntervalMs: Number(process.env.TIPPMIXPRO_OUTPUT_INTERVAL_MS ?? 1_000),
+  catalogueRefreshMs: envNumber("TIPPMIXPRO_CATALOGUE_REFRESH_MS", 300_000, {
+    integer: true,
+    min: 1_000,
+  }),
+  outputIntervalMs: envNumber("TIPPMIXPRO_OUTPUT_INTERVAL_MS", 1_000, {
+    integer: true,
+    min: 100,
+  }),
+  cdpCommandTimeoutMs: envNumber("CDP_COMMAND_TIMEOUT_MS", 15_000, {
+    integer: true,
+    min: 1_000,
+    max: 120_000,
+  }),
   once: process.env.TIPPMIXPRO_ONCE === "1",
 };
 
@@ -36,10 +47,23 @@ class CdpClient {
   async connect() {
     this.socket = new WebSocket(this.webSocketUrl);
     await new Promise((resolve, reject) => {
-      this.socket.addEventListener("open", resolve, { once: true });
+      const timeout = setTimeout(
+        () => {
+          reject(new Error("TippmixPro CDP kapcsolódási időtúllépés."));
+          this.socket?.close();
+        },
+        CONFIG.cdpCommandTimeoutMs,
+      );
+      this.socket.addEventListener("open", () => {
+        clearTimeout(timeout);
+        resolve();
+      }, { once: true });
       this.socket.addEventListener(
         "error",
-        () => reject(new Error("Nem sikerült kapcsolódni a CDP WebSockethez.")),
+        () => {
+          clearTimeout(timeout);
+          reject(new Error("Nem sikerült kapcsolódni a CDP WebSockethez."));
+        },
         { once: true },
       );
     });
@@ -54,7 +78,11 @@ class CdpClient {
     }
     const id = ++this.nextId;
     const result = new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        reject(new Error(`TippmixPro CDP parancs időtúllépés: ${method}`));
+      }, CONFIG.cdpCommandTimeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
     });
     this.socket.send(JSON.stringify({ id, method, params }));
     return result;
@@ -93,6 +121,11 @@ class CdpClient {
 
   close() {
     this.closed = true;
+    for (const { reject, timer } of this.pending.values()) {
+      clearTimeout(timer);
+      reject(new Error("A CDP kapcsolat lezárult."));
+    }
+    this.pending.clear();
     this.socket?.close();
   }
 
@@ -101,6 +134,7 @@ class CdpClient {
     if (message.id && this.pending.has(message.id)) {
       const pending = this.pending.get(message.id);
       this.pending.delete(message.id);
+      clearTimeout(pending.timer);
       if (message.error) pending.reject(new Error(JSON.stringify(message.error)));
       else pending.resolve(message.result);
       return;
@@ -117,7 +151,8 @@ class CdpClient {
 
   #onClose() {
     if (this.closed) return;
-    for (const { reject } of this.pending.values()) {
+    for (const { reject, timer } of this.pending.values()) {
+      clearTimeout(timer);
       reject(new Error("A CDP kapcsolat váratlanul megszakadt."));
     }
     this.pending.clear();
@@ -125,7 +160,9 @@ class CdpClient {
 }
 
 async function findTarget() {
-  const response = await fetch(`${CONFIG.cdpEndpoint}/json`);
+  const response = await fetch(`${CONFIG.cdpEndpoint}/json`, {
+    signal: AbortSignal.timeout(CONFIG.cdpCommandTimeoutMs),
+  });
   if (!response.ok) throw new Error(`A CDP targetlista HTTP ${response.status} hibát adott.`);
   const targets = await response.json();
   const target = targets.find(
@@ -138,7 +175,7 @@ async function findTarget() {
   return target;
 }
 
-function browserCollectorSource() {
+export function browserCollectorSource() {
   return `(() => {
     const VERSION = 1;
     const BASE = "/sports/2901/hu/";
@@ -154,9 +191,13 @@ function browserCollectorSource() {
       generation: 0,
       connected: false,
       connectPromise: null,
+      cancelConnect: null,
+      reconnectTimer: null,
+      closing: false,
       pendingRegistrations: new Map(),
       pendingCalls: new Map(),
       pendingRpcs: new Map(),
+      pendingRequestTimers: new Map(),
       registrationTopics: new Map(),
       subscribedTopics: new Set(),
       queuedOfferIds: new Set(),
@@ -177,27 +218,61 @@ function browserCollectorSource() {
         return this.requestId;
       },
 
+      startRequestTimeout(requestId, label, onTimeout) {
+        this.clearRequestTimeout(requestId);
+        const timer = setTimeout(() => {
+          this.pendingRequestTimers.delete(requestId);
+          onTimeout();
+          this.lastError = "TippmixPro WAMP időtúllépés: " + label;
+        }, 15_000);
+        this.pendingRequestTimers.set(requestId, timer);
+      },
+
+      clearRequestTimeout(requestId) {
+        clearTimeout(this.pendingRequestTimers.get(requestId));
+        this.pendingRequestTimers.delete(requestId);
+      },
+
       async connect() {
+        if (this.closing) throw new Error("A TippmixPro collector leáll.");
         if (this.socket?.readyState === WebSocket.OPEN && this.connected) return;
         if (this.connectPromise) return this.connectPromise;
         const generation = ++this.generation;
-        this.connectPromise = new Promise((resolve, reject) => {
+        const pendingConnection = new Promise((resolve, reject) => {
           const socket = new WebSocket(
             "wss://sportsapi.tippmixpro.hu/v2",
             ["wamp.2.json"],
           );
           this.socket = socket;
-          const timeout = setTimeout(
-            () => reject(new Error("TippmixPro WAMP kapcsolódási időtúllépés.")),
-            10_000,
-          );
+          let settled = false;
+          const settle = (handler, value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            if (this.cancelConnect === cancel) this.cancelConnect = null;
+            handler(value);
+          };
+          const cancel = error => settle(reject, error);
+          this.cancelConnect = cancel;
+          const timeout = setTimeout(() => {
+            const error = new Error("TippmixPro WAMP kapcsolódási időtúllépés.");
+            this.lastError = error.message;
+            cancel(error);
+            try { socket.close(); } catch { /* A socket már lezáródhatott. */ }
+          }, 10_000);
 
           socket.onopen = () => {
-            socket.send(JSON.stringify([
-              1,
-              "www.tippmixpro.hu",
-              { roles: { caller: {}, callee: {} }, agent: "SharpX monitor" },
-            ]));
+            try {
+              socket.send(JSON.stringify([
+                1,
+                "www.tippmixpro.hu",
+                { roles: { caller: {}, callee: {} }, agent: "SharpX monitor" },
+              ]));
+            } catch (error) {
+              this.lastError = String(error?.stack ?? error);
+              cancel(error);
+              try { socket.close(); } catch { /* A socket már lezáródhatott. */ }
+            }
           };
           socket.onmessage = event => {
             if (generation !== this.generation) return;
@@ -205,9 +280,9 @@ function browserCollectorSource() {
             try {
               const message = JSON.parse(String(event.data));
               if (message[0] === 2) {
-                clearTimeout(timeout);
                 this.connected = true;
-                resolve();
+                this.lastError = null;
+                settle(resolve);
               } else {
                 this.handleWampMessage(message);
               }
@@ -219,27 +294,41 @@ function browserCollectorSource() {
             this.lastError = "TippmixPro WAMP WebSocket hiba";
           };
           socket.onclose = () => {
-            clearTimeout(timeout);
-            if (generation !== this.generation) return;
+            const currentGeneration = generation === this.generation;
+            cancel(new Error("A TippmixPro WAMP kapcsolat a WELCOME előtt megszakadt."));
+            if (!currentGeneration) return;
             this.connected = false;
-            this.connectPromise = null;
             this.subscribedTopics.clear();
             this.registrationTopics.clear();
             this.pendingRegistrations.clear();
             this.pendingCalls.clear();
+            for (const timer of this.pendingRequestTimers.values()) clearTimeout(timer);
+            this.pendingRequestTimers.clear();
             for (const pending of this.pendingRpcs.values()) {
+              clearTimeout(pending.timer);
               pending.reject(new Error("A TippmixPro WAMP kapcsolat megszakadt."));
             }
             this.pendingRpcs.clear();
-            setTimeout(() => void this.reconnect(), 1000);
+            this.scheduleReconnect(1000);
           };
-        }).finally(() => {
-          if (generation === this.generation) this.connectPromise = null;
         });
-        return this.connectPromise;
+        const trackedConnection = pendingConnection.finally(() => {
+          if (this.connectPromise === trackedConnection) this.connectPromise = null;
+        });
+        this.connectPromise = trackedConnection;
+        return trackedConnection;
+      },
+
+      scheduleReconnect(delayMs) {
+        if (this.closing || this.reconnectTimer) return;
+        this.reconnectTimer = setTimeout(() => {
+          this.reconnectTimer = null;
+          void this.reconnect();
+        }, delayMs);
       },
 
       async reconnect() {
+        if (this.closing) return;
         try {
           await this.connect();
           const tournamentIds = [...this.tournaments.keys()];
@@ -248,7 +337,7 @@ function browserCollectorSource() {
           await this.subscribeTournaments(tournamentIds);
         } catch (error) {
           this.lastError = String(error?.stack ?? error);
-          setTimeout(() => void this.reconnect(), 5000);
+          this.scheduleReconnect(5000);
         }
       },
 
@@ -264,15 +353,37 @@ function browserCollectorSource() {
         this.subscribedTopics.add(topic);
         const requestId = this.nextRequestId();
         this.pendingRegistrations.set(requestId, topic);
-        this.send([64, requestId, {}, topic]);
+        this.startRequestTimeout(requestId, "REGISTER " + topic, () => {
+          this.pendingRegistrations.delete(requestId);
+          this.subscribedTopics.delete(topic);
+        });
+        try {
+          this.send([64, requestId, {}, topic]);
+        } catch (error) {
+          this.clearRequestTimeout(requestId);
+          this.pendingRegistrations.delete(requestId);
+          this.subscribedTopics.delete(topic);
+          throw error;
+        }
       },
 
       rpc(procedure, kwargs) {
         const requestId = this.nextRequestId();
         const result = new Promise((resolve, reject) => {
-          this.pendingRpcs.set(requestId, { resolve, reject });
+          const timer = setTimeout(() => {
+            if (!this.pendingRpcs.delete(requestId)) return;
+            reject(new Error("TippmixPro WAMP RPC időtúllépés: " + procedure));
+          }, 15_000);
+          this.pendingRpcs.set(requestId, { resolve, reject, timer });
         });
-        this.send([48, requestId, {}, procedure, [], kwargs]);
+        try {
+          this.send([48, requestId, {}, procedure, [], kwargs]);
+        } catch (error) {
+          const pending = this.pendingRpcs.get(requestId);
+          this.pendingRpcs.delete(requestId);
+          clearTimeout(pending?.timer);
+          pending?.reject(error);
+        }
         return result;
       },
 
@@ -282,19 +393,34 @@ function browserCollectorSource() {
           const requestId = message[1];
           const registrationId = message[2];
           const topic = this.pendingRegistrations.get(requestId);
+          this.clearRequestTimeout(requestId);
           this.pendingRegistrations.delete(requestId);
           if (!topic) return;
           this.registrationTopics.set(registrationId, topic);
           const callId = this.nextRequestId();
           this.pendingCalls.set(callId, topic);
-          this.send([48, callId, {}, "/sports#initialDump", [], { topic }]);
+          this.startRequestTimeout(callId, "initialDump " + topic, () => {
+            this.pendingCalls.delete(callId);
+            this.subscribedTopics.delete(topic);
+          });
+          try {
+            this.send([48, callId, {}, "/sports#initialDump", [], { topic }]);
+          } catch (error) {
+            this.clearRequestTimeout(callId);
+            this.pendingCalls.delete(callId);
+            this.registrationTopics.delete(registrationId);
+            this.subscribedTopics.delete(topic);
+            throw error;
+          }
           return;
         }
         if (type === 50) {
           const requestId = message[1];
+          this.clearRequestTimeout(requestId);
           const rpc = this.pendingRpcs.get(requestId);
           if (rpc) {
             this.pendingRpcs.delete(requestId);
+            clearTimeout(rpc.timer);
             rpc.resolve(message[4]);
             return;
           }
@@ -309,12 +435,26 @@ function browserCollectorSource() {
           this.send([70, message[1], {}]);
           return;
         }
-        if (type === 8 || type === 66) {
-          const requestId = message[1];
+        if (type === 8) {
+          // WAMP ERROR: [ERROR, requestType, requestId, ...]. The old code used
+          // message[1], leaving the actual request permanently pending.
+          const requestId = message[2];
+          this.clearRequestTimeout(requestId);
           const rpc = this.pendingRpcs.get(requestId);
           if (rpc) {
             this.pendingRpcs.delete(requestId);
+            clearTimeout(rpc.timer);
             rpc.reject(new Error("WAMP RPC hiba: " + JSON.stringify(message)));
+          }
+          const pendingTopic = this.pendingCalls.get(requestId);
+          if (pendingTopic) {
+            this.pendingCalls.delete(requestId);
+            this.subscribedTopics.delete(pendingTopic);
+          }
+          const registrationTopic = this.pendingRegistrations.get(requestId);
+          if (registrationTopic) {
+            this.pendingRegistrations.delete(requestId);
+            this.subscribedTopics.delete(registrationTopic);
           }
           this.lastError = "TippmixPro WAMP hiba: " + JSON.stringify(message);
         }
@@ -363,7 +503,14 @@ function browserCollectorSource() {
             return;
           }
           const previous = map.get(record.id) ?? { id: record.id };
-          map.set(record.id, { ...previous, ...record.changedProperties });
+          const next = { ...previous, ...record.changedProperties };
+          map.set(record.id, next);
+          if (
+            record.entityType === "BETTING_OFFER" &&
+            ["69", "693"].includes(String(next.bettingTypeId))
+          ) {
+            this.queueOffer(record.id);
+          }
           return;
         }
 
@@ -379,10 +526,31 @@ function browserCollectorSource() {
       },
 
       queueOffer(offerId) {
-        if (this.subscribedOfferIds.has(offerId)) return;
+        if (this.closing || this.subscribedOfferIds.has(offerId)) return;
         this.queuedOfferIds.add(offerId);
         clearTimeout(this.offerFlushTimer);
-        this.offerFlushTimer = setTimeout(() => this.flushOffers(), 250);
+        this.offerFlushTimer = setTimeout(() => {
+          this.offerFlushTimer = null;
+          try {
+            this.flushOffers();
+          } catch (error) {
+            this.lastError = String(error?.stack ?? error);
+            this.scheduleOfferFlush(1000);
+          }
+        }, 250);
+      },
+
+      scheduleOfferFlush(delayMs) {
+        if (this.closing || this.offerFlushTimer || this.queuedOfferIds.size === 0) return;
+        this.offerFlushTimer = setTimeout(() => {
+          this.offerFlushTimer = null;
+          try {
+            this.flushOffers();
+          } catch (error) {
+            this.lastError = String(error?.stack ?? error);
+            this.scheduleOfferFlush(1000);
+          }
+        }, delayMs);
       },
 
       flushOffers() {
@@ -390,8 +558,13 @@ function browserCollectorSource() {
         this.queuedOfferIds.clear();
         for (let index = 0; index < ids.length; index += 30) {
           const chunk = ids.slice(index, index + 30);
-          for (const id of chunk) this.subscribedOfferIds.add(id);
-          this.subscribeAndDump(BASE + "bettingOffers/" + chunk.join(","));
+          try {
+            this.subscribeAndDump(BASE + "bettingOffers/" + chunk.join(","));
+            for (const id of chunk) this.subscribedOfferIds.add(id);
+          } catch (error) {
+            for (const id of ids.slice(index)) this.queuedOfferIds.add(id);
+            throw error;
+          }
         }
       },
 
@@ -542,6 +715,13 @@ function browserCollectorSource() {
               superOdds?.inPlay === true ||
               match.statusName === "Live",
             statusId: match.statusId,
+            statusName: match.statusName ?? null,
+            score: match.score ?? match.scoreText ?? match.currentScore ?? null,
+            homeScore: match.homeScore ?? null,
+            awayScore: match.awayScore ?? null,
+            period: match.period ?? match.periodName ?? null,
+            minute: match.minute ?? match.elapsed ?? null,
+            redCards: match.redCards ?? null,
             odds: primary.odds,
             regularOdds: regular?.odds ?? null,
             superOdds: superOdds?.odds ?? null,
@@ -570,9 +750,24 @@ function browserCollectorSource() {
       },
 
       shutdown() {
+        this.closing = true;
         this.generation += 1;
         clearTimeout(this.offerFlushTimer);
+        clearTimeout(this.reconnectTimer);
+        this.offerFlushTimer = null;
+        this.reconnectTimer = null;
         this.connected = false;
+        this.cancelConnect?.(new Error("A TippmixPro collector leállt."));
+        this.cancelConnect = null;
+        for (const pending of this.pendingRpcs.values()) {
+          clearTimeout(pending.timer);
+          pending.reject(new Error("A TippmixPro collector leállt."));
+        }
+        this.pendingRpcs.clear();
+        for (const timer of this.pendingRequestTimers.values()) clearTimeout(timer);
+        this.pendingRequestTimers.clear();
+        this.pendingCalls.clear();
+        this.pendingRegistrations.clear();
         this.socket?.close();
       },
     };
@@ -590,20 +785,15 @@ const browserShutdownSource =
   "globalThis.__tippmixProMatchOddsCollector?.shutdown?.()";
 
 async function writeAtomically(filename, content) {
-  const temporaryFile = `${filename}.tmp`;
-  await fs.writeFile(temporaryFile, content, "utf8");
-  try {
-    await fs.rename(temporaryFile, filename);
-  } catch (error) {
-    if (error.code !== "EEXIST" && error.code !== "EPERM") throw error;
-    await fs.rm(filename, { force: true });
-    await fs.rename(temporaryFile, filename);
-  }
+  await writeTextAtomically(filename, content);
 }
 
 async function main() {
-  const target = await findTarget();
-  const cdp = new CdpClient(target.webSocketDebuggerUrl);
+  const writerLock = await acquireWriterLock(
+    CONFIG.outputFile,
+    "TippmixPro production monitor",
+  );
+  let cdp = null;
   let contextId;
   let catalogueTimer;
   let outputTimer;
@@ -612,24 +802,35 @@ async function main() {
   let lastStatus = "";
   let recoveryPromise = null;
 
+  const connectCdp = async (force = false) => {
+    if (!force && cdp?.socket?.readyState === WebSocket.OPEN) return;
+    cdp?.close();
+    const target = await findTarget();
+    const nextClient = new CdpClient(target.webSocketDebuggerUrl);
+    await nextClient.connect();
+    cdp = nextClient;
+    contextId = undefined;
+  };
+
   const stop = async exitCode => {
     if (stopping) return;
     stopping = true;
     clearInterval(catalogueTimer);
     clearInterval(outputTimer);
     try {
-      if (contextId) await cdp.evaluate(browserShutdownSource, contextId, false);
+      if (contextId && cdp) await cdp.evaluate(browserShutdownSource, contextId, false);
     } catch {
       // A böngésző vagy az iframe ekkor már bezáródhatott.
     }
-    cdp.close();
+    cdp?.close();
+    await writerLock.release();
     process.exitCode = exitCode;
   };
 
   process.once("SIGINT", () => void stop(0));
   process.once("SIGTERM", () => void stop(0));
 
-  await cdp.connect();
+  await connectCdp();
 
   const recoverCollector = () => {
     if (recoveryPromise) return recoveryPromise;
@@ -637,6 +838,9 @@ async function main() {
       let lastError;
       for (let attempt = 0; attempt < 20 && !stopping; attempt += 1) {
         try {
+          if (attempt > 0 || cdp?.socket?.readyState !== WebSocket.OPEN) {
+            await connectCdp(attempt > 0);
+          }
           contextId = await cdp.waitForSportsContext();
           await cdp.evaluate(browserCollectorSource(), contextId);
           const result = await cdp.evaluate(browserRefreshSource, contextId);
@@ -665,7 +869,12 @@ async function main() {
       );
     } catch (error) {
       console.error(`[catalogue] ${error.message}`);
-      await recoverCollector();
+      try {
+        await recoverCollector();
+      } catch (recoveryError) {
+        console.error(`[recovery] ${recoveryError.message}`);
+        await stop(1);
+      }
     }
   };
 
@@ -674,16 +883,25 @@ async function main() {
     writing = true;
     try {
       const snapshot = await cdp.evaluate(browserSnapshotSource, contextId);
-      if ((snapshot.events.length === 0 || snapshot.pendingWork > 0) && lastStatus) return;
       await writeAtomically(CONFIG.outputFile, `${JSON.stringify(snapshot, null, 2)}\n`);
-      const status = `${snapshot.events.length} events, ${snapshot.subscribedTopics} topics`;
+      const status =
+        `${snapshot.events.length} events, ${snapshot.subscribedTopics} topics, ` +
+        `${snapshot.connected ? "connected" : "disconnected"}, ` +
+        `${snapshot.pendingWork} pending`;
       if (status !== lastStatus) {
         lastStatus = status;
         console.log(`[output] ${status} -> ${CONFIG.outputFile}`);
       }
     } catch (error) {
       console.error(`[output] ${error.message}`);
-      await recoverCollector();
+      if (!error?.isOutputError) {
+        try {
+          await recoverCollector();
+        } catch (recoveryError) {
+          console.error(`[recovery] ${recoveryError.message}`);
+          await stop(1);
+        }
+      }
     } finally {
       writing = false;
     }
@@ -710,7 +928,9 @@ async function main() {
   outputTimer = setInterval(() => void writeOutput(), CONFIG.outputIntervalMs);
 }
 
-main().catch(error => {
-  console.error(error.stack ?? error);
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch(error => {
+    console.error(error.stack ?? error);
+    process.exitCode = 1;
+  });
+}

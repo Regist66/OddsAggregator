@@ -2,11 +2,24 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { acquireWriterLock, writeTextAtomically } from "./atomic_file.js";
+import { envNumber } from "./numeric_config.js";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(SCRIPT_DIR, "..");
 const DATA_DIR = path.join(PROJECT_DIR, "data");
 const CONFIG_DIR = path.join(PROJECT_DIR, "config");
+
+export function resolveVegasTimezoneOffsetMinutes(value, date = new Date()) {
+  if (value === undefined || value === null || value === "") {
+    return date.getTimezoneOffset();
+  }
+  const offset = Number(value);
+  if (!Number.isInteger(offset) || offset < -840 || offset > 840) {
+    throw new Error(`Érvénytelen VEGAS_TIMEZONE_OFFSET_MINUTES: ${value}`);
+  }
+  return offset;
+}
 
 const CONFIG = {
   cdpEndpoint: process.env.VEGAS_CDP_ENDPOINT ?? "http://127.0.0.1:9222",
@@ -17,10 +30,36 @@ const CONFIG = {
     process.env.SHARPX_WATCHLIST_FILE ?? path.join(DATA_DIR, "sharpx_watchlist.json"),
   teamAliasesFile:
     process.env.TEAM_ALIASES_FILE ?? path.join(CONFIG_DIR, "team_aliases.json"),
-  outputIntervalMs: Number(process.env.VEGAS_OUTPUT_INTERVAL_MS ?? 1_000),
-  matchedRefreshMs: Number(process.env.VEGAS_MATCHED_REFRESH_MS ?? 5_000),
-  catalogueRefreshMs: Number(process.env.VEGAS_CATALOGUE_REFRESH_MS ?? 300_000),
-  liveRefreshMs: Number(process.env.VEGAS_LIVE_REFRESH_MS ?? 1_000),
+  outputIntervalMs: envNumber("VEGAS_OUTPUT_INTERVAL_MS", 1_000, {
+    integer: true,
+    min: 100,
+  }),
+  matchedRefreshMs: envNumber("VEGAS_MATCHED_REFRESH_MS", 5_000, {
+    integer: true,
+    min: 250,
+  }),
+  catalogueRefreshMs: envNumber("VEGAS_CATALOGUE_REFRESH_MS", 300_000, {
+    integer: true,
+    min: 1_000,
+  }),
+  liveRefreshMs: envNumber("VEGAS_LIVE_REFRESH_MS", 1_000, {
+    integer: true,
+    min: 250,
+  }),
+  requestTimeoutMs: envNumber("VEGAS_REQUEST_TIMEOUT_MS", 15_000, {
+    integer: true,
+    min: 100,
+    max: 120_000,
+  }),
+  cdpCommandTimeoutMs: envNumber("CDP_COMMAND_TIMEOUT_MS", 15_000, {
+    integer: true,
+    min: 1_000,
+    max: 120_000,
+  }),
+  timezoneOffsetMinutes:
+    process.env.VEGAS_TIMEZONE_OFFSET_MINUTES === undefined
+      ? null
+      : resolveVegasTimezoneOffsetMinutes(process.env.VEGAS_TIMEZONE_OFFSET_MINUTES),
   once: process.env.VEGAS_ONCE === "1",
 };
 
@@ -42,10 +81,23 @@ class CdpClient {
   async connect() {
     this.socket = new WebSocket(this.webSocketUrl);
     await new Promise((resolve, reject) => {
-      this.socket.addEventListener("open", resolve, { once: true });
+      const timeout = setTimeout(
+        () => {
+          reject(new Error("Vegas CDP kapcsolódási időtúllépés."));
+          this.socket?.close();
+        },
+        CONFIG.cdpCommandTimeoutMs,
+      );
+      this.socket.addEventListener("open", () => {
+        clearTimeout(timeout);
+        resolve();
+      }, { once: true });
       this.socket.addEventListener(
         "error",
-        () => reject(new Error("Nem sikerült kapcsolódni a Vegas CDP targethez.")),
+        () => {
+          clearTimeout(timeout);
+          reject(new Error("Nem sikerült kapcsolódni a Vegas CDP targethez."));
+        },
         { once: true },
       );
     });
@@ -60,7 +112,11 @@ class CdpClient {
     }
     const id = ++this.nextId;
     const result = new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        reject(new Error(`Vegas CDP parancs időtúllépés: ${method}`));
+      }, CONFIG.cdpCommandTimeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
     });
     this.socket.send(JSON.stringify({ id, method, params }));
     return result;
@@ -100,6 +156,11 @@ class CdpClient {
 
   close() {
     this.closed = true;
+    for (const { reject, timer } of this.pending.values()) {
+      clearTimeout(timer);
+      reject(new Error("A Vegas CDP kapcsolat lezárult."));
+    }
+    this.pending.clear();
     this.socket?.close();
   }
 
@@ -108,6 +169,7 @@ class CdpClient {
     if (message.id && this.pending.has(message.id)) {
       const pending = this.pending.get(message.id);
       this.pending.delete(message.id);
+      clearTimeout(pending.timer);
       if (message.error) pending.reject(new Error(JSON.stringify(message.error)));
       else pending.resolve(message.result);
       return;
@@ -124,7 +186,8 @@ class CdpClient {
 
   #onClose() {
     if (this.closed) return;
-    for (const { reject } of this.pending.values()) {
+    for (const { reject, timer } of this.pending.values()) {
+      clearTimeout(timer);
       reject(new Error("A Vegas CDP kapcsolat váratlanul megszakadt."));
     }
     this.pending.clear();
@@ -132,7 +195,9 @@ class CdpClient {
 }
 
 async function findVegasTarget() {
-  const response = await fetch(`${CONFIG.cdpEndpoint}/json`);
+  const response = await fetch(`${CONFIG.cdpEndpoint}/json`, {
+    signal: AbortSignal.timeout(CONFIG.cdpCommandTimeoutMs),
+  });
   if (!response.ok) throw new Error(`A CDP targetlista HTTP ${response.status} hibát adott.`);
   const targets = (await response.json()).filter(
     item =>
@@ -147,23 +212,25 @@ async function findVegasTarget() {
   return target;
 }
 
-function browserCollectorSource() {
+export function browserCollectorSource() {
   const options = JSON.stringify({
     liveRefreshMs: CONFIG.liveRefreshMs,
     catalogueRefreshMs: CONFIG.catalogueRefreshMs,
     enhancedRefreshMs: CONFIG.matchedRefreshMs,
+    requestTimeoutMs: CONFIG.requestTimeoutMs,
+    timezoneOffsetMinutes: CONFIG.timezoneOffsetMinutes,
   });
 
   return `(() => {
     globalThis.__vegasSoccerCollector?.shutdown?.();
     const options = ${options};
     const BASE = "https://hu-sb2frontend-altenar2.biahosted.com/api/widget/";
-    const QUERY =
-      "?culture=hu-HU&timezoneOffset=-120&integration=vegas.hu" +
-      "&deviceType=1&numFormat=hu-HU&countryCode=LU";
 
     const collector = {
       events: new Map(),
+      // IDs confirmed by the latest public prematch catalogue or live overview.
+      // Targeted/event-detail endpoints alone must not keep a removed offer alive.
+      availableEventIds: new Set(),
       liveEventIds: new Set(),
       enhancedEventIds: new Set(),
       lastCatalogueRefreshAt: null,
@@ -176,12 +243,36 @@ function browserCollectorSource() {
       matchedEventsBusy: false,
       timers: [],
 
+      query() {
+        // getTimezoneOffset follows DST for long-running processes. An explicit
+        // override remains available for reproducible tests or provider quirks.
+        const timezoneOffset = Number.isInteger(options.timezoneOffsetMinutes)
+          ? options.timezoneOffsetMinutes
+          : new Date().getTimezoneOffset();
+        return (
+          "?culture=hu-HU&timezoneOffset=" + timezoneOffset +
+          "&integration=vegas.hu&deviceType=1&numFormat=hu-HU&countryCode=LU"
+        );
+      },
+
       async request(endpoint, parameters = "") {
-        const response = await fetch(BASE + endpoint + QUERY + parameters, {
-          cache: "no-store",
-        });
-        if (!response.ok) throw new Error(endpoint + " HTTP " + response.status);
-        return response.json();
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), options.requestTimeoutMs);
+        try {
+          const response = await fetch(BASE + endpoint + this.query() + parameters, {
+            cache: "no-store",
+            signal: controller.signal,
+          });
+          if (!response.ok) throw new Error(endpoint + " HTTP " + response.status);
+          return await response.json();
+        } catch (error) {
+          if (error?.name === "AbortError") {
+            throw new Error(endpoint + " kérés időtúllépés");
+          }
+          throw error;
+        } finally {
+          clearTimeout(timeout);
+        }
       },
 
       isOneXTwoMarket(market, selections, enhanced = false) {
@@ -236,6 +327,13 @@ function browserCollectorSource() {
             enhancedUpdatedAt: previous?.enhancedUpdatedAt ?? null,
             live: source === "live",
             status: event.status,
+            statusName: event.statusName ?? event.statusText ?? null,
+            score: event.score ?? event.scoreString ?? event.currentScore ?? null,
+            homeScore: event.homeScore ?? null,
+            awayScore: event.awayScore ?? null,
+            period: event.period ?? event.periodName ?? null,
+            minute: event.minute ?? event.elapsed ?? null,
+            redCards: event.redCards ?? null,
             updatedAt: Date.now(),
           };
           destination.set(event.id, mapped);
@@ -279,15 +377,21 @@ function browserCollectorSource() {
               });
             }
           }
-          if (nextEvents.size > 0) this.events = nextEvents;
+          if (failedChamps > 0) {
+            this.lastError = failedChamps + " bajnokság lekérése sikertelen";
+            throw new Error(this.lastError);
+          }
+          if (nextEvents.size > 0) {
+            this.events = nextEvents;
+            this.availableEventIds = new Set(nextEvents.keys());
+          }
           this.lastCatalogueRefreshAt = Date.now();
-          this.lastError = failedChamps
-            ? failedChamps + " bajnokság lekérése sikertelen"
-            : null;
+          this.lastError = null;
           return {
             events: this.events.size,
             championships: champIds.length,
             failedChamps,
+            committed: true,
           };
         } finally {
           this.catalogueBusy = false;
@@ -297,7 +401,8 @@ function browserCollectorSource() {
       async refreshEvents(eventIds) {
         if (this.matchedEventsBusy) return { busy: true };
         this.matchedEventsBusy = true;
-        const uniqueIds = [...new Set(eventIds.map(Number).filter(Number.isFinite))];
+        const requestedIds = [...new Set(eventIds.map(Number).filter(Number.isFinite))];
+        const uniqueIds = requestedIds.filter(id => this.availableEventIds.has(id));
         try {
           const batches = [];
           for (let start = 0; start < uniqueIds.length; start += 50) {
@@ -308,8 +413,20 @@ function browserCollectorSource() {
               this.request("GetEventsById", "&eventIds=" + batch.join(",")),
             ),
           );
-          for (const payload of payloads) this.mapPayload(payload, "prematch");
-          return { refreshedEvents: uniqueIds.length };
+          const refreshedEvents = new Map();
+          for (const payload of payloads) {
+            this.mapPayload(payload, "prematch", refreshedEvents);
+          }
+          for (const [id, event] of refreshedEvents) {
+            // A catalogue refresh may have completed while the targeted request
+            // was in flight. Recheck before merging its response.
+            if (this.availableEventIds.has(id)) this.events.set(id, event);
+          }
+          return {
+            refreshedEvents: [...refreshedEvents.keys()]
+              .filter(id => this.availableEventIds.has(id)).length,
+            skippedUnavailableEvents: requestedIds.length - uniqueIds.length,
+          };
         } finally {
           this.matchedEventsBusy = false;
         }
@@ -325,6 +442,7 @@ function browserCollectorSource() {
             if (!currentIds.has(id)) this.events.delete(id);
           }
           this.liveEventIds = currentIds;
+          for (const id of currentIds) this.availableEventIds.add(id);
           this.lastLiveRefreshAt = Date.now();
         } catch (error) {
           this.lastError = error.message;
@@ -359,6 +477,7 @@ function browserCollectorSource() {
 
         for (const event of payload.events ?? []) {
           if (event.sportId !== 66) continue;
+          if (!this.availableEventIds.has(event.id)) continue;
           const market = (event.marketIds ?? [])
             .map(id => markets.get(id))
             .find(item => {
@@ -391,6 +510,13 @@ function browserCollectorSource() {
             enhancedUpdatedAt: Date.now(),
             live: previous?.live ?? false,
             status: event.status,
+            statusName: event.statusName ?? event.statusText ?? previous?.statusName ?? null,
+            score: event.score ?? event.scoreString ?? event.currentScore ?? previous?.score ?? null,
+            homeScore: event.homeScore ?? previous?.homeScore ?? null,
+            awayScore: event.awayScore ?? previous?.awayScore ?? null,
+            period: event.period ?? event.periodName ?? previous?.period ?? null,
+            minute: event.minute ?? event.elapsed ?? previous?.minute ?? null,
+            redCards: event.redCards ?? previous?.redCards ?? null,
             updatedAt: previous?.updatedAt ?? Date.now(),
           });
           currentIds.add(event.id);
@@ -418,7 +544,7 @@ function browserCollectorSource() {
           const selections = oddIds.map(id => oddsById.get(id)).filter(Boolean);
           const byType = new Map(selections.map(item => [item.typeId, item]));
           const previous = this.events.get(details.id);
-          if (!previous) continue;
+          if (!previous || !this.availableEventIds.has(details.id)) continue;
           this.events.set(details.id, {
             ...previous,
             odds: [1, 2, 3].map(typeId => {
@@ -462,13 +588,21 @@ function browserCollectorSource() {
     };
 
     globalThis.__vegasSoccerCollector = collector;
+    const runSafely = (label, operation) => {
+      void operation().catch(error => {
+        collector.lastError = label + ": " + String(error?.message ?? error);
+      });
+    };
     collector.timers.push(
-      setInterval(() => void collector.refreshLive(), options.liveRefreshMs),
+      setInterval(() => runSafely("live", () => collector.refreshLive()), options.liveRefreshMs),
       setInterval(
-        () => void collector.refreshEnhancedOdds(),
+        () => runSafely("enhanced", () => collector.refreshEnhancedOdds()),
         options.enhancedRefreshMs,
       ),
-      setInterval(() => void collector.refreshCatalogue(), options.catalogueRefreshMs),
+      setInterval(
+        () => runSafely("catalogue", () => collector.refreshCatalogue()),
+        options.catalogueRefreshMs,
+      ),
     );
     return true;
   })()`;
@@ -495,7 +629,7 @@ function teamAliasKey(value) {
     .trim();
 }
 
-async function refreshTeamAliases() {
+export async function refreshTeamAliases() {
   const stats = await fs.stat(CONFIG.teamAliasesFile);
   if (stats.mtimeMs === teamAliasesModifiedAt) return;
   const document = JSON.parse(await fs.readFile(CONFIG.teamAliasesFile, "utf8"));
@@ -561,7 +695,7 @@ function diceCoefficient(leftValue, rightValue) {
   return (2 * matches) / (left.length + right.length - 2);
 }
 
-function createEventTimeIndex(events) {
+export function createEventTimeIndex(events) {
   const index = new Map();
   for (const event of events) {
     const startTime = Number(event.startTime);
@@ -574,7 +708,7 @@ function createEventTimeIndex(events) {
   return index;
 }
 
-function timeCandidates(index, startTime) {
+export function timeCandidates(index, startTime) {
   const timestamp = Number(startTime);
   if (!Number.isFinite(timestamp)) return [];
   const bucket = Math.floor(timestamp / EVENT_TIME_BUCKET_MS);
@@ -615,7 +749,7 @@ function competitionsCompatible(left, right) {
   return diceCoefficient(left, right) >= 0.55;
 }
 
-function findVegasEvent(watchEvent, vegasEvents) {
+export function findVegasEvent(watchEvent, vegasEvents) {
   let best = null;
   for (const event of vegasEvents) {
     const timeDifference = Math.abs(Number(event.startTime) - Number(watchEvent.startTime));
@@ -638,7 +772,7 @@ function findVegasEvent(watchEvent, vegasEvents) {
   return best?.event ?? null;
 }
 
-async function readJson(filename) {
+export async function readJson(filename) {
   try {
     return JSON.parse(await fs.readFile(filename, "utf8"));
   } catch (error) {
@@ -648,20 +782,15 @@ async function readJson(filename) {
 }
 
 async function writeAtomically(filename, content) {
-  const temporaryFile = `${filename}.tmp`;
-  await fs.writeFile(temporaryFile, content, "utf8");
-  try {
-    await fs.rename(temporaryFile, filename);
-  } catch (error) {
-    if (error.code !== "EEXIST" && error.code !== "EPERM") throw error;
-    await fs.rm(filename, { force: true });
-    await fs.rename(temporaryFile, filename);
-  }
+  await writeTextAtomically(filename, content);
 }
 
 async function main() {
-  const target = await findVegasTarget();
-  const cdp = new CdpClient(target.webSocketDebuggerUrl);
+  const writerLock = await acquireWriterLock(
+    CONFIG.outputFile,
+    "Vegas production monitor",
+  );
+  let cdp = null;
   let contextId;
   let outputTimer;
   let matchedRefreshTimer;
@@ -670,6 +799,17 @@ async function main() {
   let refreshingMatchedEvents = false;
   let selectedIds = [];
   let lastStatus = "";
+  let initializationPromise = null;
+
+  const connectCdp = async (force = false) => {
+    if (!force && cdp?.socket?.readyState === WebSocket.OPEN) return;
+    cdp?.close();
+    const target = await findVegasTarget();
+    const nextClient = new CdpClient(target.webSocketDebuggerUrl);
+    await nextClient.connect();
+    cdp = nextClient;
+    contextId = undefined;
+  };
 
   const stop = async exitCode => {
     if (stopping) return;
@@ -677,17 +817,18 @@ async function main() {
     clearInterval(outputTimer);
     clearInterval(matchedRefreshTimer);
     try {
-      if (contextId) await cdp.evaluate(browserShutdownSource, contextId, false);
+      if (contextId && cdp) await cdp.evaluate(browserShutdownSource, contextId, false);
     } catch {
       // A böngésző ekkor már bezáródhatott.
     }
-    cdp.close();
+    cdp?.close();
+    await writerLock.release();
     process.exitCode = exitCode;
   };
 
   process.once("SIGINT", () => void stop(0));
   process.once("SIGTERM", () => void stop(0));
-  await cdp.connect();
+  await connectCdp();
 
   const initialize = async () => {
     contextId = await cdp.waitForMainContext();
@@ -699,6 +840,32 @@ async function main() {
       `[catalogue] ${catalogue.events} soccer events, ` +
       `${catalogue.championships} championships, ${catalogue.failedChamps} failed`,
     );
+  };
+
+  const initializeWithRetry = () => {
+    if (initializationPromise) return initializationPromise;
+    initializationPromise = (async () => {
+      let attempt = 0;
+      while (!stopping) {
+        try {
+          if (cdp?.socket?.readyState !== WebSocket.OPEN || attempt > 0) {
+            await connectCdp(attempt > 0);
+          }
+          await initialize();
+          return true;
+        } catch (error) {
+          attempt += 1;
+          // A Vegas oldal első betöltésekor a CDP execution context navigáció
+          // közben megszűnhet. Új target-kapcsolattal próbálkozunk tovább.
+          console.error(`[initialize] ${error.message}; újrapróbálás 1 mp múlva.`);
+          await sleep(1_000);
+        }
+      }
+      return false;
+    })().finally(() => {
+      initializationPromise = null;
+    });
+    return initializationPromise;
   };
 
   const refreshMatchedEvents = async () => {
@@ -733,11 +900,7 @@ async function main() {
       }
     } catch (error) {
       console.error(`[matched-refresh] ${error.message}`);
-      try {
-        await initialize();
-      } catch (recoveryError) {
-        console.error(`[recovery] ${recoveryError.message}`);
-      }
+      await initializeWithRetry();
     } finally {
       refreshingMatchedEvents = false;
     }
@@ -761,17 +924,16 @@ async function main() {
       }
     } catch (error) {
       console.error(`[output] ${error.message}`);
-      try {
-        await initialize();
-      } catch (recoveryError) {
-        console.error(`[recovery] ${recoveryError.message}`);
-      }
+      if (!error?.isOutputError) await initializeWithRetry();
     } finally {
       writing = false;
     }
   };
 
-  await initialize();
+  if (!await initializeWithRetry()) {
+    await stop(0);
+    return;
+  }
   await refreshMatchedEvents();
   await writeOutput();
   if (CONFIG.once) {
@@ -785,7 +947,9 @@ async function main() {
   outputTimer = setInterval(() => void writeOutput(), CONFIG.outputIntervalMs);
 }
 
-main().catch(error => {
-  console.error(error.stack ?? error);
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch(error => {
+    console.error(error.stack ?? error);
+    process.exitCode = 1;
+  });
+}
