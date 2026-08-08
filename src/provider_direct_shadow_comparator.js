@@ -1,0 +1,469 @@
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+import { numericOption, validateNamedArguments } from "./numeric_config.js";
+
+function argument(name, fallback) {
+  const flag = `--${name}`;
+  const index = process.argv.indexOf(flag);
+  if (index < 0) return fallback;
+  if (process.argv.indexOf(flag, index + 1) >= 0) {
+    throw new Error(`Dupla CLI kapcsoló: ${flag}`);
+  }
+  const value = process.argv[index + 1];
+  if (!value || value.startsWith("--")) throw new Error(`Hiányzó érték: ${flag}`);
+  return value;
+}
+
+function numberArgument(name, fallback, constraints = {}) {
+  return numericOption(argument(name, String(fallback)), `--${name}`, {
+    ...constraints,
+  });
+}
+
+function normalizedProvider(value) {
+  const provider = String(value ?? "").trim().toLowerCase();
+  return provider === "tippmix" ? "tippmixpro" : provider;
+}
+
+validateNamedArguments([
+  "provider", "normal-file", "direct-file", "output-dir", "duration-hours",
+  "interval-ms", "warmup-ms", "normal-max-content-age-ms",
+  "direct-max-content-age-ms", "max-snapshot-skew-ms", "catalogue-max-age-ms",
+  "tippmix-frame-max-age-ms", "vegas-live-max-age-ms",
+  "vegas-enhanced-max-age-ms",
+]);
+
+const configuredIntervalMs = numberArgument("interval-ms", 1000, {
+  integer: true,
+  min: 100,
+});
+const CONFIG = {
+  provider: normalizedProvider(argument("provider", "provider")),
+  normalFile: path.resolve(argument("normal-file", "data/normal.json")),
+  directFile: path.resolve(argument("direct-file", "data/direct.json")),
+  outputDir: path.resolve(argument("output-dir", "logs/direct-shadow")),
+  durationMs: numberArgument("duration-hours", 2, { min: 0, max: 720 }) * 3_600_000,
+  intervalMs: configuredIntervalMs,
+  warmupMs: numberArgument("warmup-ms", 30_000, { integer: true, min: 0 }),
+  normalMaxContentAgeMs: numberArgument("normal-max-content-age-ms", 10_000, { integer: true, min: 0 }),
+  directMaxContentAgeMs: numberArgument("direct-max-content-age-ms", 5_000, { integer: true, min: 0 }),
+  maxSnapshotSkewMs: numberArgument("max-snapshot-skew-ms", 5_000, { integer: true, min: 0 }),
+  catalogueMaxAgeMs: numberArgument("catalogue-max-age-ms", 660_000, { integer: true, min: 0 }),
+  tippmixFrameMaxAgeMs: numberArgument("tippmix-frame-max-age-ms", 15_000, { integer: true, min: 0 }),
+  vegasLiveMaxAgeMs: numberArgument("vegas-live-max-age-ms", 5_000, { integer: true, min: 0 }),
+  vegasEnhancedMaxAgeMs: numberArgument("vegas-enhanced-max-age-ms", 15_000, { integer: true, min: 0 }),
+};
+
+const SUPPORTED_PROVIDERS = new Set(["tippmixpro", "vegas"]);
+const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+export function timestamp(value) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) return numeric;
+  if (typeof value !== "string") return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+export function eventId(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return "";
+  const value = event.id ?? event.eventId;
+  return value === null || value === undefined ? "" : String(value).trim();
+}
+
+function eventInPlay(provider, event) {
+  const value = provider === "vegas" ? event?.live : event?.inPlay;
+  return typeof value === "boolean" ? value : null;
+}
+
+function eventStatus(provider, event) {
+  const candidates = provider === "vegas"
+    ? [event?.status, event?.statusName]
+    : [event?.statusId, event?.statusName];
+  const value = candidates.find(candidate => candidate !== null && candidate !== undefined && candidate !== "");
+  return value === undefined ? null : String(value);
+}
+
+function eventStartTime(event) {
+  const value = Number(event?.startTime);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function eventOdds(event) {
+  if (!Array.isArray(event?.odds) || event.odds.length !== 3) return null;
+  const normalized = [];
+  for (const value of event.odds) {
+    if (value === null) {
+      normalized.push(null);
+      continue;
+    }
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) return null;
+    normalized.push(numeric);
+  }
+  return normalized;
+}
+
+function sameArray(left, right) {
+  return Array.isArray(left)
+    && Array.isArray(right)
+    && left.length === right.length
+    && left.every((value, index) => value === right[index]);
+}
+
+function freshness(reasons, document, field, maximumAgeMs, now) {
+  const value = timestamp(document?.[field]);
+  const label = field.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`);
+  if (!value) {
+    reasons.add(`${label}-missing`);
+    return { value: null, ageMs: null };
+  }
+  const ageMs = now - value;
+  if (ageMs < -1_000) reasons.add(`${label}-future`);
+  else if (ageMs > maximumAgeMs) reasons.add(`${label}-stale`);
+  return { value, ageMs };
+}
+
+function validateEvents(provider, events) {
+  const reasons = new Set();
+  const ids = new Set();
+  let validEvents = 0;
+  if (!Array.isArray(events)) {
+    reasons.add("events-unavailable");
+    return { reasons, ids, eventCount: 0, validEvents };
+  }
+
+  for (const event of events) {
+    if (!event || typeof event !== "object" || Array.isArray(event)) {
+      reasons.add("event-invalid");
+      continue;
+    }
+    const id = eventId(event);
+    if (!id) reasons.add("event-id-missing");
+    else if (ids.has(id)) reasons.add("event-id-duplicate");
+    else ids.add(id);
+    if (!eventStartTime(event)) reasons.add("event-start-time-invalid");
+    if (!eventOdds(event)) reasons.add("event-odds-invalid");
+    if (eventInPlay(provider, event) === null) reasons.add("event-in-play-invalid");
+    if (eventStatus(provider, event) === null) reasons.add("event-status-missing");
+    if (
+      id
+      && eventStartTime(event)
+      && eventOdds(event)
+      && eventInPlay(provider, event) !== null
+      && eventStatus(provider, event) !== null
+    ) validEvents += 1;
+  }
+  return { reasons, ids, eventCount: events.length, validEvents };
+}
+
+export async function readSnapshot(file) {
+  let stats = null;
+  try {
+    stats = await fs.stat(file);
+    const text = await fs.readFile(file, "utf8");
+    return {
+      ok: true,
+      fileAgeMs: Math.max(0, Date.now() - stats.mtimeMs),
+      document: JSON.parse(text),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      fileAgeMs: stats ? Math.max(0, Date.now() - stats.mtimeMs) : null,
+      error: error.code ?? error.message,
+    };
+  }
+}
+
+export function sideHealth(side, policy, now = Date.now()) {
+  const provider = normalizedProvider(policy.provider);
+  const document = side.document;
+  const reasons = new Set();
+  if (!side.ok) reasons.add("read-failed");
+  if (side.ok && (!document || typeof document !== "object" || Array.isArray(document))) {
+    reasons.add("document-invalid");
+  }
+  if (!SUPPORTED_PROVIDERS.has(provider)) reasons.add("provider-unsupported");
+
+  const safeDocument = document && typeof document === "object" && !Array.isArray(document)
+    ? document
+    : {};
+  const generated = freshness(reasons, safeDocument, "generatedAt", policy.maxContentAgeMs, now);
+  const catalogue = freshness(reasons, safeDocument, "lastCatalogueRefreshAt", policy.catalogueMaxAgeMs, now);
+  if (side.ok && Number.isFinite(side.fileAgeMs) && side.fileAgeMs > policy.maxContentAgeMs) {
+    reasons.add("file-stale");
+  }
+
+  const eventValidation = validateEvents(provider, safeDocument.events);
+  for (const reason of eventValidation.reasons) reasons.add(reason);
+
+  const sourceHealth = {};
+  if (provider === "tippmixpro") {
+    sourceHealth.connected = safeDocument.connected === true;
+    sourceHealth.pendingWork = Number(safeDocument.pendingWork);
+    if (safeDocument.connected !== true) reasons.add("disconnected");
+    if (!Number.isInteger(sourceHealth.pendingWork) || sourceHealth.pendingWork < 0) {
+      reasons.add("pending-work-invalid");
+    } else if (sourceHealth.pendingWork > 0) {
+      reasons.add("pending-work");
+    }
+    const frame = freshness(reasons, safeDocument, "lastFrameAt", policy.tippmixFrameMaxAgeMs, now);
+    sourceHealth.lastFrameAt = frame.value;
+    sourceHealth.lastFrameAgeMs = frame.ageMs;
+  } else if (provider === "vegas") {
+    const live = freshness(reasons, safeDocument, "lastLiveRefreshAt", policy.vegasLiveMaxAgeMs, now);
+    const enhanced = freshness(
+      reasons,
+      safeDocument,
+      "lastEnhancedRefreshAt",
+      policy.vegasEnhancedMaxAgeMs,
+      now,
+    );
+    sourceHealth.lastLiveRefreshAt = live.value;
+    sourceHealth.lastLiveAgeMs = live.ageMs;
+    sourceHealth.lastEnhancedRefreshAt = enhanced.value;
+    sourceHealth.lastEnhancedAgeMs = enhanced.ageMs;
+  }
+
+  return {
+    ok: side.ok === true,
+    healthy: reasons.size === 0,
+    unhealthyReasons: [...reasons],
+    error: side.error ?? null,
+    provider,
+    fileAgeMs: side.fileAgeMs ?? null,
+    generatedAt: generated.value,
+    contentAgeMs: generated.ageMs,
+    maxContentAgeMs: policy.maxContentAgeMs,
+    catalogueRefreshAt: catalogue.value,
+    catalogueAgeMs: catalogue.ageMs,
+    catalogueMaxAgeMs: policy.catalogueMaxAgeMs,
+    events: eventValidation.eventCount,
+    validEvents: eventValidation.validEvents,
+    uniqueEventIds: eventValidation.ids.size,
+    lastError: safeDocument.lastError ?? null,
+    ...sourceHealth,
+  };
+}
+
+export function eventsById(document) {
+  const result = new Map();
+  for (const event of Array.isArray(document?.events) ? document.events : []) {
+    const id = eventId(event);
+    if (id) result.set(id, event);
+  }
+  return result;
+}
+
+function fieldCounts() {
+  return { compared: 0, agreements: 0, mismatches: 0 };
+}
+
+function countField(target, agrees) {
+  target.compared += 1;
+  if (agrees) target.agreements += 1;
+  else target.mismatches += 1;
+}
+
+function withAgreementRatio(counts) {
+  return {
+    ...counts,
+    agreementRatio: counts.compared > 0 ? counts.agreements / counts.compared : null,
+  };
+}
+
+export function compareSnapshots(normalDocument, directDocument, providerValue) {
+  const provider = normalizedProvider(providerValue);
+  const normalById = eventsById(normalDocument);
+  const directById = eventsById(directDocument);
+  const normalIds = new Set(normalById.keys());
+  const directIds = new Set(directById.keys());
+  const commonIds = [...normalIds].filter(id => directIds.has(id));
+  const fields = {
+    odds: fieldCounts(),
+    status: fieldCounts(),
+    inPlay: fieldCounts(),
+    startTime: fieldCounts(),
+    allFields: fieldCounts(),
+  };
+
+  for (const id of commonIds) {
+    const normal = normalById.get(id);
+    const direct = directById.get(id);
+    const agreements = {
+      odds: sameArray(eventOdds(normal), eventOdds(direct)),
+      status: eventStatus(provider, normal) === eventStatus(provider, direct),
+      inPlay: eventInPlay(provider, normal) === eventInPlay(provider, direct),
+      startTime: eventStartTime(normal) === eventStartTime(direct),
+    };
+    for (const [field, agrees] of Object.entries(agreements)) countField(fields[field], agrees);
+    countField(fields.allFields, Object.values(agreements).every(Boolean));
+  }
+
+  return {
+    normalEvents: normalIds.size,
+    directEvents: directIds.size,
+    commonEvents: commonIds.length,
+    normalOnly: normalIds.size - commonIds.length,
+    directOnly: directIds.size - commonIds.length,
+    fields: Object.fromEntries(
+      Object.entries(fields).map(([field, counts]) => [field, withAgreementRatio(counts)]),
+    ),
+  };
+}
+
+export function createStats() {
+  return {
+    samples: 0,
+    warmupSamples: 0,
+    eligibleSamples: 0,
+    readySamples: 0,
+    validSamples: 0,
+    invalidSamples: 0,
+    // Kept for compatibility. Warmup is intentionally not counted as stale.
+    staleSamples: 0,
+    invalidSamplesByReason: {},
+    normalOnlyMax: 0,
+    directOnlyMax: 0,
+    normalOnlyObservations: 0,
+    directOnlyObservations: 0,
+    commonEventObservations: 0,
+    odds: fieldCounts(),
+    status: fieldCounts(),
+    inPlay: fieldCounts(),
+    startTime: fieldCounts(),
+    allFields: fieldCounts(),
+  };
+}
+
+function incrementReasons(target, reasons) {
+  for (const reason of reasons) target[reason] = (target[reason] ?? 0) + 1;
+}
+
+export function recordSample(stats, { warmup, sampleValid, invalidReasons = [], comparison = null }) {
+  stats.samples += 1;
+  if (warmup) {
+    stats.warmupSamples += 1;
+    return;
+  }
+  stats.eligibleSamples += 1;
+  if (!sampleValid || !comparison) {
+    stats.invalidSamples += 1;
+    stats.staleSamples += 1;
+    incrementReasons(stats.invalidSamplesByReason, invalidReasons);
+    return;
+  }
+
+  stats.readySamples += 1;
+  stats.validSamples += 1;
+  stats.normalOnlyMax = Math.max(stats.normalOnlyMax, comparison.normalOnly);
+  stats.directOnlyMax = Math.max(stats.directOnlyMax, comparison.directOnly);
+  stats.normalOnlyObservations += comparison.normalOnly;
+  stats.directOnlyObservations += comparison.directOnly;
+  stats.commonEventObservations += comparison.commonEvents;
+  for (const field of ["odds", "status", "inPlay", "startTime", "allFields"]) {
+    stats[field].compared += comparison.fields[field].compared;
+    stats[field].agreements += comparison.fields[field].agreements;
+    stats[field].mismatches += comparison.fields[field].mismatches;
+  }
+}
+
+export function summarizedStats(stats) {
+  return {
+    ...stats,
+    readinessRatio: stats.eligibleSamples > 0 ? stats.readySamples / stats.eligibleSamples : null,
+    odds: withAgreementRatio(stats.odds),
+    status: withAgreementRatio(stats.status),
+    inPlay: withAgreementRatio(stats.inPlay),
+    startTime: withAgreementRatio(stats.startTime),
+    allFields: withAgreementRatio(stats.allFields),
+  };
+}
+
+export async function main(config = CONFIG) {
+  if (!SUPPORTED_PROVIDERS.has(config.provider)) {
+    throw new Error(`Nem tamogatott provider: ${config.provider}. Hasznald: vegas vagy tippmixpro.`);
+  }
+  await fs.mkdir(config.outputDir, { recursive: true });
+  const healthFile = path.join(config.outputDir, "health.jsonl");
+  const summaryFile = path.join(config.outputDir, "summary.json");
+  const startedAt = Date.now();
+  const stats = createStats();
+
+  while (Date.now() - startedAt < config.durationMs) {
+    const [normal, direct] = await Promise.all([
+      readSnapshot(config.normalFile),
+      readSnapshot(config.directFile),
+    ]);
+    const now = Date.now();
+    const normalHealth = sideHealth(normal, {
+      ...config,
+      maxContentAgeMs: config.normalMaxContentAgeMs,
+    }, now);
+    const directHealth = sideHealth(direct, {
+      ...config,
+      maxContentAgeMs: config.directMaxContentAgeMs,
+    }, now);
+    const warmup = now - startedAt < config.warmupMs;
+    const invalidReasons = [];
+    if (warmup) invalidReasons.push("warmup");
+    invalidReasons.push(...normalHealth.unhealthyReasons.map(reason => `normal-${reason}`));
+    invalidReasons.push(...directHealth.unhealthyReasons.map(reason => `direct-${reason}`));
+    const snapshotSkewMs = normalHealth.generatedAt && directHealth.generatedAt
+      ? Math.abs(normalHealth.generatedAt - directHealth.generatedAt)
+      : null;
+    if (snapshotSkewMs !== null && snapshotSkewMs > config.maxSnapshotSkewMs) {
+      invalidReasons.push("snapshot-skew-high");
+    }
+    const sampleValid = !warmup && invalidReasons.length === 0;
+    const comparison = sampleValid
+      ? compareSnapshots(normal.document, direct.document, config.provider)
+      : null;
+
+    recordSample(stats, { warmup, sampleValid, invalidReasons, comparison });
+    const item = {
+      at: new Date(now).toISOString(),
+      provider: config.provider,
+      sampleValid,
+      comparisonSkipped: !sampleValid,
+      warmup,
+      invalidReasons,
+      snapshotSkewMs,
+      maxSnapshotSkewMs: config.maxSnapshotSkewMs,
+      normal: normalHealth,
+      direct: directHealth,
+      comparison,
+      cumulative: summarizedStats(stats),
+    };
+    await fs.appendFile(healthFile, `${JSON.stringify(item)}\n`, "utf8");
+    await sleep(config.intervalMs);
+  }
+
+  const summary = {
+    provider: config.provider,
+    startedAt: new Date(startedAt).toISOString(),
+    finishedAt: new Date().toISOString(),
+    warmupMs: config.warmupMs,
+    intervalMs: config.intervalMs,
+    normalMaxContentAgeMs: config.normalMaxContentAgeMs,
+    directMaxContentAgeMs: config.directMaxContentAgeMs,
+    maxSnapshotSkewMs: config.maxSnapshotSkewMs,
+    catalogueMaxAgeMs: config.catalogueMaxAgeMs,
+    tippmixFrameMaxAgeMs: config.tippmixFrameMaxAgeMs,
+    vegasLiveMaxAgeMs: config.vegasLiveMaxAgeMs,
+    vegasEnhancedMaxAgeMs: config.vegasEnhancedMaxAgeMs,
+    ...summarizedStats(stats),
+  };
+  await fs.writeFile(summaryFile, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
+  return summary;
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch(error => {
+    console.error(error.stack ?? error);
+    process.exitCode = 1;
+  });
+}
