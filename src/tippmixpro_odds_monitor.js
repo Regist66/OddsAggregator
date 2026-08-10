@@ -177,7 +177,7 @@ async function findTarget() {
 
 export function browserCollectorSource() {
   return `(() => {
-    const VERSION = 2;
+    const VERSION = 3;
     const BASE = "/sports/2901/hu/";
     const AGGREGATOR_SUFFIX = "/default-event-info/BOTH/1380,1381,1382";
     const TARGET_DISPLAY_KEY = "b69_ep3";
@@ -198,6 +198,24 @@ export function browserCollectorSource() {
       pendingCalls: new Map(),
       pendingRpcs: new Map(),
       pendingRequestTimers: new Map(),
+      // Catalogue RPCs are background work. A slow response must not leave a
+      // request permanently pending, and a late RESULT must not be mistaken
+      // for an initialDump payload.
+      expiredRpcIds: new Set(),
+      expiredRequestIds: new Set(),
+      // Keep the queue bounded so the sports gateway is not flooded during
+      // catalogue refreshes; allow slow WAMP responses to complete instead
+      // of turning into avoidable stale/skew windows.
+      wampRpcTimeoutMs: 30_000,
+      wampRequestTimeoutMs: 30_000,
+      catalogueRpcRetryCount: 2,
+      catalogueRpcRetryBaseMs: 1_000,
+      requestTimeouts: 0,
+      rpcTimeouts: 0,
+      catalogueRpcRetries: 0,
+      topicRegistrationConcurrency: 8,
+      topicQueue: [],
+      topicQueueSet: new Set(),
       registrationTopics: new Map(),
       subscribedTopics: new Set(),
       queuedOfferIds: new Set(),
@@ -224,11 +242,14 @@ export function browserCollectorSource() {
 
       startRequestTimeout(requestId, label, onTimeout) {
         this.clearRequestTimeout(requestId);
+        const timeoutMs = Math.max(1, Number(this.wampRequestTimeoutMs) || 30_000);
         const timer = setTimeout(() => {
           this.pendingRequestTimers.delete(requestId);
+          this.expiredRequestIds.add(requestId);
+          this.requestTimeouts += 1;
           onTimeout();
           this.lastError = "TippmixPro WAMP időtúllépés: " + label;
-        }, 15_000);
+        }, timeoutMs);
         this.pendingRequestTimers.set(requestId, timer);
       },
 
@@ -241,6 +262,8 @@ export function browserCollectorSource() {
         if (this.closing) throw new Error("A TippmixPro collector leáll.");
         if (this.socket?.readyState === WebSocket.OPEN && this.connected) return;
         if (this.connectPromise) return this.connectPromise;
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
         const generation = ++this.generation;
         const pendingConnection = new Promise((resolve, reject) => {
           const socket = new WebSocket(
@@ -303,6 +326,8 @@ export function browserCollectorSource() {
             if (!currentGeneration) return;
             this.connected = false;
             this.subscribedTopics.clear();
+            this.topicQueue.length = 0;
+            this.topicQueueSet.clear();
             this.registrationTopics.clear();
             this.pendingRegistrations.clear();
             this.pendingCalls.clear();
@@ -353,31 +378,55 @@ export function browserCollectorSource() {
       },
 
       subscribeAndDump(topic) {
-        if (this.subscribedTopics.has(topic)) return;
+        if (this.subscribedTopics.has(topic) || this.topicQueueSet.has(topic)) return;
         this.subscribedTopics.add(topic);
-        const requestId = this.nextRequestId();
-        this.pendingRegistrations.set(requestId, topic);
-        this.startRequestTimeout(requestId, "REGISTER " + topic, () => {
-          this.pendingRegistrations.delete(requestId);
-          this.subscribedTopics.delete(topic);
-        });
-        try {
-          this.send([64, requestId, {}, topic]);
-        } catch (error) {
-          this.clearRequestTimeout(requestId);
-          this.pendingRegistrations.delete(requestId);
-          this.subscribedTopics.delete(topic);
-          throw error;
+        this.topicQueue.push(topic);
+        this.topicQueueSet.add(topic);
+        this.drainTopicQueue();
+      },
+
+      drainTopicQueue() {
+        if (this.closing) return;
+        const limit = Math.max(1, Number(this.topicRegistrationConcurrency) || 8);
+        while (
+          this.topicQueue.length > 0 &&
+          this.pendingRegistrations.size + this.pendingCalls.size < limit
+        ) {
+          const topic = this.topicQueue.shift();
+          this.topicQueueSet.delete(topic);
+          const requestId = this.nextRequestId();
+          this.pendingRegistrations.set(requestId, topic);
+          this.startRequestTimeout(requestId, "REGISTER " + topic, () => {
+            this.pendingRegistrations.delete(requestId);
+            this.subscribedTopics.delete(topic);
+            this.drainTopicQueue();
+          });
+          try {
+            this.send([64, requestId, {}, topic]);
+          } catch (error) {
+            this.clearRequestTimeout(requestId);
+            this.pendingRegistrations.delete(requestId);
+            this.subscribedTopics.delete(topic);
+            this.drainTopicQueue();
+            throw error;
+          }
         }
       },
 
       rpc(procedure, kwargs) {
         const requestId = this.nextRequestId();
         const result = new Promise((resolve, reject) => {
+          const timeoutMs = Math.max(1, Number(this.wampRpcTimeoutMs) || 30_000);
           const timer = setTimeout(() => {
             if (!this.pendingRpcs.delete(requestId)) return;
-            reject(new Error("TippmixPro WAMP RPC időtúllépés: " + procedure));
-          }, 15_000);
+            this.rpcTimeouts += 1;
+            this.expiredRpcIds.add(requestId);
+            const error = new Error("TippmixPro WAMP RPC időtúllépés: " + procedure);
+            error.code = "WAMP_RPC_TIMEOUT";
+            this.lastError = error.message;
+            reject(error);
+            return;
+          }, timeoutMs);
           this.pendingRpcs.set(requestId, { resolve, reject, timer });
         });
         try {
@@ -391,29 +440,60 @@ export function browserCollectorSource() {
         return result;
       },
 
+      isRetryableRpcError(error) {
+        return error?.code === "WAMP_RPC_TIMEOUT";
+      },
+
+      async rpcWithRetry(procedure, kwargs) {
+        const retryCount = Math.max(0, Number(this.catalogueRpcRetryCount) || 0);
+        let lastError;
+        for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+          try {
+            const result = await this.rpc(procedure, kwargs);
+            if (attempt > 0) this.lastError = null;
+            return result;
+          } catch (error) {
+            lastError = error;
+            if (this.closing || attempt >= retryCount || !this.isRetryableRpcError(error)) {
+              throw error;
+            }
+            this.catalogueRpcRetries += 1;
+            const delay = Math.max(1, Number(this.catalogueRpcRetryBaseMs) || 1_000)
+              * 2 ** attempt;
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
+        }
+        throw lastError;
+      },
+
       handleWampMessage(message) {
         const type = message[0];
         if (type === 65) {
           const requestId = message[1];
+          if (this.expiredRequestIds.delete(requestId)) return;
           const registrationId = message[2];
           const topic = this.pendingRegistrations.get(requestId);
           this.clearRequestTimeout(requestId);
           this.pendingRegistrations.delete(requestId);
           if (!topic) return;
+          this.lastError = null;
           this.registrationTopics.set(registrationId, topic);
           const callId = this.nextRequestId();
           this.pendingCalls.set(callId, topic);
           this.startRequestTimeout(callId, "initialDump " + topic, () => {
             this.pendingCalls.delete(callId);
             this.subscribedTopics.delete(topic);
+            this.drainTopicQueue();
           });
           try {
             this.send([48, callId, {}, "/sports#initialDump", [], { topic }]);
+            this.drainTopicQueue();
           } catch (error) {
             this.clearRequestTimeout(callId);
             this.pendingCalls.delete(callId);
             this.registrationTopics.delete(registrationId);
             this.subscribedTopics.delete(topic);
+            this.drainTopicQueue();
             throw error;
           }
           return;
@@ -421,16 +501,23 @@ export function browserCollectorSource() {
         if (type === 50) {
           const requestId = message[1];
           this.clearRequestTimeout(requestId);
+          if (this.expiredRpcIds.delete(requestId) || this.expiredRequestIds.delete(requestId)) return;
           const rpc = this.pendingRpcs.get(requestId);
           if (rpc) {
             this.pendingRpcs.delete(requestId);
             clearTimeout(rpc.timer);
+            this.lastError = null;
             rpc.resolve(message[4]);
+            this.drainTopicQueue();
             return;
           }
           const topic = this.pendingCalls.get(requestId) ?? "";
           this.pendingCalls.delete(requestId);
+          if (topic) {
+            this.lastError = null;
+          }
           this.processPayload(message[4], topic);
+          this.drainTopicQueue();
           return;
         }
         if (type === 68) {
@@ -444,6 +531,7 @@ export function browserCollectorSource() {
           // message[1], leaving the actual request permanently pending.
           const requestId = message[2];
           this.clearRequestTimeout(requestId);
+          if (this.expiredRpcIds.delete(requestId) || this.expiredRequestIds.delete(requestId)) return;
           const rpc = this.pendingRpcs.get(requestId);
           if (rpc) {
             this.pendingRpcs.delete(requestId);
@@ -460,6 +548,7 @@ export function browserCollectorSource() {
             this.pendingRegistrations.delete(requestId);
             this.subscribedTopics.delete(registrationTopic);
           }
+          this.drainTopicQueue();
           this.lastError = "TippmixPro WAMP hiba: " + JSON.stringify(message);
         }
       },
@@ -574,7 +663,7 @@ export function browserCollectorSource() {
 
       async discoverTournamentIds() {
         await this.connect();
-        const locationsPayload = await this.rpc("/sports#locations", {
+        const locationsPayload = await this.rpcWithRetry("/sports#locations", {
           lang: "hu",
           sportId: "1",
           locationTypes: ["COUNTRY", "CONTINENT", "WORLD", "MISC"],
@@ -584,7 +673,7 @@ export function browserCollectorSource() {
         );
         const tournamentPayloads = await Promise.all(
           locations.map(location =>
-            this.rpc("/sports#tournaments", {
+            this.rpcWithRetry("/sports#tournaments", {
               lang: "hu",
               sportId: "1",
               eventCategoryId: String(location.id) + "001",
@@ -627,6 +716,7 @@ export function browserCollectorSource() {
         const ids = await this.discoverTournamentIds();
         await this.subscribeTournaments(ids);
         this.lastCatalogueRefreshAt = Date.now();
+        this.lastError = null;
         return {
           tournamentIds: ids.length,
           subscribedTopics: this.subscribedTopics.size,
@@ -793,6 +883,7 @@ export function browserCollectorSource() {
           catalogueRequests: this.pendingRpcs.size,
           topicRegistrations: this.pendingRegistrations.size,
           initialDumps: this.pendingCalls.size,
+          queuedTopics: this.topicQueue.length,
           queuedOffers: this.queuedOfferIds.size,
         };
         const pendingWork = Object.values(pendingWorkDetails)
@@ -812,6 +903,10 @@ export function browserCollectorSource() {
           pendingWork,
           pendingWorkDetails,
           snapshotConsistency,
+          rpcTimeouts: this.rpcTimeouts,
+          catalogueRpcRetries: this.catalogueRpcRetries,
+          requestTimeouts: this.requestTimeouts,
+          expiredRpcResponses: this.expiredRpcIds.size + this.expiredRequestIds.size,
           tournamentCount: this.tournaments.size,
           subscribedTopics: this.subscribedTopics.size,
           lastCatalogueRefreshAt: this.lastCatalogueRefreshAt,
@@ -840,6 +935,10 @@ export function browserCollectorSource() {
         this.pendingRequestTimers.clear();
         this.pendingCalls.clear();
         this.pendingRegistrations.clear();
+        this.topicQueue.length = 0;
+        this.topicQueueSet.clear();
+        this.expiredRpcIds.clear();
+        this.expiredRequestIds.clear();
         this.socket?.close();
       },
     };

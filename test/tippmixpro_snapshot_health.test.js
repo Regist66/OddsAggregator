@@ -43,6 +43,7 @@ function healthySnapshot(overrides = {}) {
       catalogueRequests: 0,
       topicRegistrations: 0,
       initialDumps: 0,
+      queuedTopics: 0,
       queuedOffers: 0,
     },
     snapshotConsistency: {
@@ -115,6 +116,7 @@ test("TippmixPro collector separates background protocol work from snapshot cons
     catalogueRequests: 0,
     topicRegistrations: 1,
     initialDumps: 1,
+    queuedTopics: 0,
     queuedOffers: 1,
   });
   assert.deepEqual(snapshot.snapshotConsistency, {
@@ -131,6 +133,7 @@ test("TippmixPro health accepts consistent snapshots during background work", ()
       catalogueRequests: 20,
       topicRegistrations: 5,
       initialDumps: 10,
+      queuedTopics: 0,
       queuedOffers: 2,
     },
   });

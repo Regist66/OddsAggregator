@@ -46,9 +46,10 @@ const CONFIG = {
     integer: true,
     min: 250,
   }),
-  // Keep live retries below the comparator's 5s freshness gate. The generic
-  // request timeout remains longer for catalogue/detail calls.
-  liveRequestTimeoutMs: envNumber("VEGAS_LIVE_REQUEST_TIMEOUT_MS", 4_000, {
+  // Keep the live request comfortably below the comparator's 5s freshness
+  // gate, leaving room for response parsing and atomic snapshot publication.
+  // The generic request timeout remains longer for catalogue/detail calls.
+  liveRequestTimeoutMs: envNumber("VEGAS_LIVE_REQUEST_TIMEOUT_MS", 3_000, {
     integer: true,
     min: 100,
     max: 120_000,

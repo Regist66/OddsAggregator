@@ -148,6 +148,87 @@ test("Tippmix collector: WAMP ERROR rejects and removes the matching RPC", async
   assert.match(collector.lastError, /wamp\.error\.test/);
 });
 
+test("Tippmix collector: timed-out RPCs retry and late RESULT frames are ignored", async t => {
+  const collector = installFakeCollector(t);
+  const connecting = collector.connect();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  socket.receive([2, 12345, {}]);
+  await connecting;
+
+  collector.wampRpcTimeoutMs = 20;
+  collector.catalogueRpcRetryCount = 1;
+  collector.catalogueRpcRetryBaseMs = 1;
+  const resultPromise = collector.rpcWithRetry("/sports#locations", { sportId: "1" });
+  const firstCall = JSON.parse(socket.sent.at(-1));
+  const firstRequestId = firstCall[1];
+
+  await delay(35);
+  const secondCall = JSON.parse(socket.sent.at(-1));
+  const secondRequestId = secondCall[1];
+  assert.notEqual(secondRequestId, firstRequestId);
+  assert.equal(collector.rpcTimeouts, 1);
+  assert.equal(collector.catalogueRpcRetries, 1);
+
+  // A late response for the expired RPC must not be processed as an
+  // initialDump payload.
+  socket.receive([50, firstRequestId, {}, {}, { records: [{ _type: "MATCH", id: "late" }] }]);
+  assert.equal(collector.matches.has("late"), false);
+
+  socket.receive([50, secondRequestId, {}, {}, { records: [] }]);
+  await resultPromise;
+  assert.equal(collector.expiredRpcIds.size, 0);
+  assert.equal(collector.lastError, null);
+});
+
+test("Tippmix collector: timed-out initialDump is cleaned up and late RESULT is ignored", async t => {
+  const collector = installFakeCollector(t);
+  const connecting = collector.connect();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  socket.receive([2, 12345, {}]);
+  await connecting;
+
+  collector.wampRequestTimeoutMs = 20;
+  const topic = "/sports/2901/hu/test-topic";
+  collector.subscribeAndDump(topic);
+  const register = JSON.parse(socket.sent.at(-1));
+  socket.receive([65, register[1], 7001, {}]);
+  const initialDump = JSON.parse(socket.sent.at(-1));
+  assert.equal(initialDump[0], 48);
+
+  await delay(35);
+  assert.equal(collector.pendingCalls.has(initialDump[1]), false);
+  socket.receive([50, initialDump[1], {}, {}, { records: [{ _type: "MATCH", id: "late-dump" }] }]);
+  assert.equal(collector.matches.has("late-dump"), false);
+  assert.equal(collector.expiredRequestIds.size, 0);
+});
+
+test("Tippmix collector: topic registration queue respects the concurrency cap", async t => {
+  const collector = installFakeCollector(t);
+  const connecting = collector.connect();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  socket.receive([2, 12345, {}]);
+  await connecting;
+
+  collector.topicRegistrationConcurrency = 1;
+  collector.subscribeAndDump("/sports/2901/hu/topic-a");
+  collector.subscribeAndDump("/sports/2901/hu/topic-b");
+  assert.equal(collector.pendingRegistrations.size, 1);
+  assert.equal(collector.topicQueue.length, 1);
+
+  const firstRegister = JSON.parse(socket.sent.at(-1));
+  socket.receive([65, firstRegister[1], 7001, {}]);
+  const firstDump = JSON.parse(socket.sent.at(-1));
+  assert.equal(collector.topicQueue.length, 1);
+  socket.receive([50, firstDump[1], {}, {}, { records: [] }]);
+
+  const secondRegister = JSON.parse(socket.sent.at(-1));
+  assert.equal(secondRegister[0], 64);
+  assert.equal(collector.topicQueue.length, 0);
+});
+
 test("atomic file: repeated replace publishes the complete latest content", async t => {
   const directory = await makeTemporaryDirectory(t);
   const output = path.join(directory, "snapshot.txt");

@@ -61,7 +61,7 @@ test("a partial Vegas catalogue refresh keeps the previous complete catalogue", 
   }
 });
 
-test("Vegas live refresh uses the short retry timeout", async () => {
+test("Vegas live refresh uses the freshness-safe timeout", async () => {
   new Function(`return ${browserCollectorSource()};`)();
   const collector = globalThis.__vegasSoccerCollector;
   try {
@@ -75,7 +75,7 @@ test("Vegas live refresh uses the short retry timeout", async () => {
 
     await collector.refreshLive();
 
-    assert.equal(timeoutMs, 4_000);
+    assert.equal(timeoutMs, 3_000);
     assert.ok(Number.isFinite(collector.lastLiveRefreshAt));
   } finally {
     collector.shutdown();

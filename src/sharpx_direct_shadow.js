@@ -1,9 +1,16 @@
 import { promises as fs } from "node:fs";
+import { setDefaultResultOrder } from "node:dns";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { numericOption, validateNamedArguments } from "./numeric_config.js";
 import { acquireWriterLock, writeTextAtomically } from "./atomic_file.js";
+import { isRenderableMarket, mergeSharpXPrice } from "./sharpx_market_renderability.js";
+
+// The PIA/Gluetun network exposes AAAA records but has no usable IPv6 route.
+// Node's default fetch resolver can therefore select IPv6 and fail with
+// ETIMEDOUT before reaching the IPv4 SharpX endpoint.
+setDefaultResultOrder("ipv4first");
 
 const PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 function argument(name, fallback) {
@@ -23,6 +30,9 @@ const numberArgument = (name, fallback, constraints) =>
 validateNamedArguments([
   "output-file", "catalogue-ms", "output-ms", "fetch-timeout-ms",
   "catalogue-retry-count", "catalogue-retry-base-ms", "catalogue-retry-max-ms",
+  "catalogue-startup-timeout-ms", "catalogue-startup-retry-count",
+  "catalogue-startup-retry-base-ms", "catalogue-startup-retry-max-ms",
+  "catalogue-page-concurrency",
   "catalogue-failure-backoff-base-ms", "catalogue-failure-backoff-max-ms",
   "catalogue-absence-confirmations", "catalogue-missing-retention-ms",
   "closed-diagnostic-retention-ms", "markets-per-socket", "socket-stale-ms",
@@ -38,10 +48,15 @@ const CONFIG = {
   outputFile: path.resolve(argument("--output-file", path.join(PROJECT_DIR, "data", "sharpx-direct-shadow", "sharpx_status_snapshot.json"))),
   catalogueMs: numberArgument("--catalogue-ms", "60000", { integer: true, min: 1_000 }),
   outputMs: numberArgument("--output-ms", "1000", { integer: true, min: 100 }),
-  fetchTimeoutMs: numberArgument("--fetch-timeout-ms", "15000", { integer: true, min: 100, max: 120_000 }),
-  catalogueRetryCount: numberArgument("--catalogue-retry-count", "3", { integer: true, min: 0, max: 20 }),
-  catalogueRetryBaseMs: numberArgument("--catalogue-retry-base-ms", "750", { integer: true, min: 1 }),
-  catalogueRetryMaxMs: numberArgument("--catalogue-retry-max-ms", "8000", { integer: true, min: 1 }),
+  fetchTimeoutMs: numberArgument("--fetch-timeout-ms", "20000", { integer: true, min: 100, max: 120_000 }),
+  catalogueRetryCount: numberArgument("--catalogue-retry-count", "4", { integer: true, min: 0, max: 20 }),
+  catalogueRetryBaseMs: numberArgument("--catalogue-retry-base-ms", "1000", { integer: true, min: 1 }),
+  catalogueRetryMaxMs: numberArgument("--catalogue-retry-max-ms", "15000", { integer: true, min: 1 }),
+  catalogueStartupFetchTimeoutMs: numberArgument("--catalogue-startup-timeout-ms", "8000", { integer: true, min: 100, max: 120_000 }),
+  catalogueStartupRetryCount: numberArgument("--catalogue-startup-retry-count", "1", { integer: true, min: 0, max: 5 }),
+  catalogueStartupRetryBaseMs: numberArgument("--catalogue-startup-retry-base-ms", "500", { integer: true, min: 1 }),
+  catalogueStartupRetryMaxMs: numberArgument("--catalogue-startup-retry-max-ms", "2000", { integer: true, min: 1 }),
+  cataloguePageConcurrency: numberArgument("--catalogue-page-concurrency", "3", { integer: true, min: 1, max: 10 }),
   catalogueFailureBackoffBaseMs: numberArgument("--catalogue-failure-backoff-base-ms", "5000", { integer: true, min: 1 }),
   catalogueFailureBackoffMaxMs: numberArgument("--catalogue-failure-backoff-max-ms", "60000", { integer: true, min: 1 }),
   catalogueAbsenceConfirmations: numberArgument("--catalogue-absence-confirmations", "3", { integer: true, min: 1 }),
@@ -86,16 +101,35 @@ function shouldRetryCatalogueError(error) {
   return !Number.isInteger(status) || status === 429 || status >= 500;
 }
 
-async function cataloguePage(page, stats) {
+function catalogueRetryOptions(startup = false) {
+  if (!startup) {
+    return {
+      fetchTimeoutMs: CONFIG.fetchTimeoutMs,
+      retryCount: CONFIG.catalogueRetryCount,
+      retryBaseMs: CONFIG.catalogueRetryBaseMs,
+      retryMaxMs: CONFIG.catalogueRetryMaxMs,
+    };
+  }
+  return {
+    fetchTimeoutMs: CONFIG.catalogueStartupFetchTimeoutMs,
+    retryCount: CONFIG.catalogueStartupRetryCount,
+    retryBaseMs: CONFIG.catalogueStartupRetryBaseMs,
+    retryMaxMs: CONFIG.catalogueStartupRetryMaxMs,
+  };
+}
+
+export { catalogueRetryOptions };
+
+async function cataloguePage(page, stats, options = catalogueRetryOptions()) {
   let lastError;
-  for (let attempt = 0; attempt <= CONFIG.catalogueRetryCount; attempt += 1) {
+  for (let attempt = 0; attempt <= options.retryCount; attempt += 1) {
     stats.attempts += 1;
     try {
       const response = await fetch(`${CATALOGUE_URL}?page=${page}`, {
         method: "POST",
         headers: { accept: "application/json", "content-type": "application/json" },
         body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(CONFIG.fetchTimeoutMs),
+        signal: AbortSignal.timeout(options.fetchTimeoutMs),
       });
       if (!response.ok) {
         const error = new Error(`SharpX katalogus HTTP ${response.status}`);
@@ -105,9 +139,9 @@ async function cataloguePage(page, stats) {
       return await response.json();
     } catch (error) {
       lastError = error;
-      if (attempt >= CONFIG.catalogueRetryCount || !shouldRetryCatalogueError(error)) break;
+      if (attempt >= options.retryCount || !shouldRetryCatalogueError(error)) break;
       stats.retries += 1;
-      const delay = Math.min(CONFIG.catalogueRetryMaxMs, CONFIG.catalogueRetryBaseMs * 2 ** attempt);
+      const delay = Math.min(options.retryMaxMs, options.retryBaseMs * 2 ** attempt);
       await sleep(delay);
     }
   }
@@ -181,18 +215,20 @@ class DirectCollector {
     this.closed = false;
   }
 
-  async refreshCatalogue() {
+  async refreshCatalogue({ startup = false } = {}) {
     const stats = { attempts: 0, retries: 0 };
+    const retryOptions = catalogueRetryOptions(startup);
     const commitStats = () => {
       this.catalogueFetchAttempts += stats.attempts;
       this.catalogueFetchRetries += stats.retries;
     };
     try {
-      const first = await cataloguePage(0, stats);
+      const first = await cataloguePage(0, stats, retryOptions);
       const pageCount = Number(first.marketCatalogueList?.totalPages ?? 0);
       const pages = [first];
-      for (let start = 1; start < pageCount; start += 5) {
-        const batch = Array.from({ length: Math.min(5, pageCount - start) }, (_, offset) => cataloguePage(start + offset, stats));
+      const pageConcurrency = CONFIG.cataloguePageConcurrency;
+      for (let start = 1; start < pageCount; start += pageConcurrency) {
+        const batch = Array.from({ length: Math.min(pageConcurrency, pageCount - start) }, (_, offset) => cataloguePage(start + offset, stats, retryOptions));
         pages.push(...await Promise.all(batch));
       }
       if (this.closed) return null;
@@ -738,7 +774,7 @@ class DirectCollector {
               this.marketRecovery.delete(update.id);
               continue;
             }
-            const nextPrice = { ...previous, ...update, marketDefinition: update.marketDefinition ?? previous?.marketDefinition, rc: update.rc ?? previous?.rc ?? [], receivedAt: Date.now(), generation };
+            const nextPrice = mergeSharpXPrice(previous, update, generation, Date.now());
             this.prices.set(update.id, nextPrice);
             connection.ready.add(update.id);
             this.marketRecovery.delete(update.id);
@@ -993,6 +1029,7 @@ class DirectCollector {
       "catalogue-missing": [],
       "hysteresis-retained": [],
       "not-ready": [],
+      "not-renderable": [],
       stale: [],
       closed: [],
     };
@@ -1053,7 +1090,7 @@ class DirectCollector {
       }
       const price = state.price;
       const definition = price.marketDefinition ?? {};
-      markets.push({
+      const candidate = {
         ...market,
         inPlay: definition.inPlay ?? market.inPlay,
         status: definition.status ?? "OPEN",
@@ -1062,10 +1099,23 @@ class DirectCollector {
         apiPt: price.apiPt ?? null,
         receivedAt: price.receivedAt,
         runnerPrices: (price.rc ?? []).map(runner => ({ selectionId: Number(runner.id), bestLay: runner.bdatl?.[0] ?? null })),
-      });
+      };
+      if (!isRenderableMarket(candidate)) {
+        details["not-renderable"].push(this.marketDiagnostic(
+          candidate,
+          "not-renderable",
+          state,
+          { renderabilityReason: candidate.status !== "OPEN" ? "status-not-open" : "no-executable-lay" },
+        ));
+        continue;
+      }
+      markets.push(candidate);
     }
     const diagnosticCounts = Object.fromEntries(Object.entries(details).map(([reason, entries]) => [reason, entries.length]));
-    const missingOutputMarkets = diagnosticCounts["not-ready"] + diagnosticCounts.stale + selectedClosedMarkets;
+    const missingOutputMarkets = diagnosticCounts["not-ready"]
+      + diagnosticCounts.stale
+      + diagnosticCounts["not-renderable"]
+      + selectedClosedMarkets;
     const subscribedAccountingMatches = markets.length + missingOutputMarkets === this.selectedMarketIds.size;
     const detailLimit = Math.max(0, CONFIG.diagnosticDetailLimit);
     const limitedDetails = Object.fromEntries(Object.entries(details).map(([reason, entries]) => [reason, entries.slice(0, detailLimit)]));
@@ -1169,12 +1219,12 @@ async function main() {
   try {
     collector = new DirectCollector();
     const startedAt = Date.now();
-    const refresh = async () => {
+    const refresh = async (startup = false) => {
       const refreshStartedAt = Date.now();
       collector.catalogueRefreshInProgress = true;
       collector.catalogueRefreshStartedAt = refreshStartedAt;
       try {
-        const result = await collector.refreshCatalogue();
+        const result = await collector.refreshCatalogue({ startup });
         if (result) {
           console.log(`[catalogue] total=${result.catalogueMarkets} raw=${result.catalogueRawMarkets} unique=${result.catalogueUniqueMarkets} duplicates=${result.catalogueDuplicateMarkets} selected=${result.selectedMarkets} live=${result.liveMarkets} added=${result.addedMarkets} reused=${result.reusedMarkets} retained=${result.retainedMarkets} hysteresis=${result.catalogueRetainedByHysteresis} attempts=${result.fetchAttempts} retries=${result.fetchRetries}`);
         }
@@ -1187,7 +1237,10 @@ async function main() {
         collector.catalogueRefreshLastDurationMs = collector.catalogueRefreshCompletedAt - refreshStartedAt;
       }
     };
-    await refresh();
+    // Startup uses a short, bounded retry profile so readiness is not held
+    // hostage by the full long-running catalogue retry budget. Subsequent
+    // refreshes use the more tolerant profile and retain the last good state.
+    await refresh(true);
     let refreshPromise = null;
     const requestRefresh = () => {
       if (refreshPromise || stopped || collector.closed) return;

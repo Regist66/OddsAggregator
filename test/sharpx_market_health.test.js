@@ -2,6 +2,23 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { browserCollectorSource, sameEventPhase } from "../src/sharpx_odds_monitor.js";
+import { isRenderableMarket, mergeSharpXPrice } from "../src/sharpx_market_renderability.js";
+import { catalogueRetryOptions } from "../src/sharpx_direct_shadow.js";
+
+test("SharpX uses a bounded retry profile during startup", () => {
+  assert.deepEqual(catalogueRetryOptions(true), {
+    fetchTimeoutMs: 8_000,
+    retryCount: 1,
+    retryBaseMs: 500,
+    retryMaxMs: 2_000,
+  });
+  assert.deepEqual(catalogueRetryOptions(false), {
+    fetchTimeoutMs: 20_000,
+    retryCount: 4,
+    retryBaseMs: 1_000,
+    retryMaxMs: 15_000,
+  });
+});
 
 function seededCollector({ status = "OPEN", inPlay = true, oddsAgeMs = 0, rc } = {}) {
   new Function(`return ${browserCollectorSource()};`)();
@@ -56,6 +73,28 @@ test("SharpX excludes SUSPENDED prices even when an old rc is cached", () => {
     collector.shutdown();
     delete globalThis.__sharpXMatchOddsCollector;
   }
+});
+
+test("SharpX direct renderability matches the browser collector", () => {
+  const runners = [
+    { selectionId: 1, bestLay: { odds: 2.1 } },
+    { selectionId: 58805, bestLay: { odds: 3.2 } },
+    { selectionId: 2, bestLay: { odds: 3.5 } },
+  ];
+  assert.equal(isRenderableMarket({ status: "OPEN", runnerPrices: runners }), true);
+  assert.equal(isRenderableMarket({ status: "SUSPENDED", runnerPrices: runners }), false);
+  assert.equal(isRenderableMarket({
+    status: "OPEN",
+    runnerPrices: runners.map(runner => ({ ...runner, bestLay: { odds: 0 } })),
+  }), false);
+});
+
+test("SharpX direct does not revive cached rc after suspension", () => {
+  const previous = { rc: [{ id: 1, bdatl: [{ odds: 2.1 }] }] };
+  const suspended = mergeSharpXPrice(previous, { marketDefinition: { status: "SUSPENDED" } }, 2, 100);
+  assert.deepEqual(suspended.rc, []);
+  const reopened = mergeSharpXPrice(suspended, { marketDefinition: { status: "OPEN" } }, 2, 200);
+  assert.deepEqual(reopened.rc, []);
 });
 
 test("SharpX excludes stale live prices", () => {

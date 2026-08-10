@@ -1,0 +1,6 @@
+.git
+data
+logs
+node_modules
+*.tmp
+*.lock

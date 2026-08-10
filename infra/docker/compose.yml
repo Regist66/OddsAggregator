@@ -1,0 +1,77 @@
+name: oddsaggregator
+
+services:
+  chrome:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    image: oddsaggregator-headless:local
+    container_name: oddsaggregator-chrome
+    network_mode: "container:pia-gluetun"
+    shm_size: "1gb"
+    volumes:
+      - chrome-profile:/chrome-profile
+    command: ["node", "/usr/local/bin/start-chrome.mjs"]
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:9333/json/version').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  tippmixpro:
+    image: oddsaggregator-headless:local
+    container_name: oddsaggregator-tippmixpro
+    network_mode: "container:pia-gluetun"
+    depends_on:
+      chrome:
+        condition: service_healthy
+    volumes:
+      - ../../runtime/data:/app/data
+    environment:
+      TIPPMIXPRO_CDP_ENDPOINT: http://127.0.0.1:9333
+      TIPPMIXPRO_OUTPUT_FILE: /app/data/tippmixpro_odds_snapshot.json
+      TIPPMIXPRO_SNAPSHOT_FILE: /app/data/tippmixpro_odds_snapshot.json
+    command: ["node", "--title=oddsaggregator-headless-primary", "src/tippmixpro_odds_monitor.js"]
+
+  sharpx:
+    image: oddsaggregator-headless:local
+    container_name: oddsaggregator-sharpx
+    network_mode: "container:pia-gluetun"
+    depends_on:
+      chrome:
+        condition: service_healthy
+    volumes:
+      - ../../runtime/data:/app/data
+    environment:
+      SHARPX_CDP_ENDPOINT: http://127.0.0.1:9333
+      SHARPX_OUTPUT_FILE: /app/data/combined_odds.txt
+      SUREBETS_OUTPUT_FILE: /app/data/football/surebets_live_odds.txt
+      SHARPX_WATCHLIST_FILE: /app/data/sharpx_watchlist.json
+      SHARPX_STATUS_SNAPSHOT_FILE: /app/data/sharpx_status_snapshot.json
+      TIPPMIXPRO_SNAPSHOT_FILE: /app/data/tippmixpro_odds_snapshot.json
+      VEGAS_SNAPSHOT_FILE: /app/data/vegas_odds_snapshot.json
+    command: ["node", "--title=oddsaggregator-headless-primary", "src/sharpx_odds_monitor.js"]
+
+  vegas:
+    image: oddsaggregator-headless:local
+    container_name: oddsaggregator-vegas
+    network_mode: "container:pia-gluetun"
+    depends_on:
+      chrome:
+        condition: service_healthy
+    volumes:
+      - ../../runtime/data:/app/data
+    environment:
+      VEGAS_CDP_ENDPOINT: http://127.0.0.1:9333
+      VEGAS_OUTPUT_FILE: /app/data/vegas_odds_snapshot.json
+      VEGAS_SNAPSHOT_FILE: /app/data/vegas_odds_snapshot.json
+      SHARPX_WATCHLIST_FILE: /app/data/sharpx_watchlist.json
+    command: ["node", "--title=oddsaggregator-headless-primary", "src/vegas_odds_monitor.js"]
+
+volumes:
+  chrome-profile:

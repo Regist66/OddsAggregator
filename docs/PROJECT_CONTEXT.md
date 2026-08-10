@@ -178,6 +178,22 @@ nem állítja le egymást.
 - Snapshot: 1 másodperces célciklus.
 - Ötpercenként tournament-discoveryt és subscription-frissítést/bővítést végez;
   nem üríti és építi újra teljesen minden alkalommal az összes adatmapet.
+- A katalógus WAMP RPC-k két retry-t kapnak időtúllépés után. A `REGISTER` és
+  `initialDump` timeoutok azonnal takarítják a pending állapotot; a következő
+  katalógus-frissítés kontrolláltan újra felveszi a topicot, a későn érkező
+  RESULT/ERROR kereteket pedig a collector eldobja. A topic-regisztrációk
+  legfeljebb 8 párhuzamos WAMP munkára vannak korlátozva, hogy a burst ne
+  okozzon timeout-vihart.
+
+### SharpX katalógus stabilitás
+
+- A SharpX katalóguslapok normál fetch timeoutja 20 másodperc, oldalanként legfeljebb
+  négy retry fut (1–15 másodperces exponenciális várakozással). Induláskor külön,
+  rövid profil érvényesül: 8 másodperces timeout és legfeljebb egy retry, így egy
+  átmeneti hálózati hiba nem tartja hosszú ideig blokkolva a readiness-t.
+- A lapok egyszerre legfeljebb három párhuzamos kéréssel töltődnek, hogy az ETIMEDOUT
+  hibák ne terhelési burstből keletkezzenek. Sikertelen frissítéskor megmarad az előző
+  konzisztens katalógus.
 
 ### Vegas – `src\vegas_odds_monitor.js`
 
@@ -332,7 +348,9 @@ megadott duration állítja le őket; a collector konténerek `--rm` módban fut
   exponenciális cooldown 2 percről legfeljebb 15 percre nő.
 - A `CLOSED` piac az aktív kimenetből kiesik, diagnosztikája 5 percig megmarad.
 - A `marketDiagnostics` okonként számolja/listázza a `catalogue-missing`,
-  `hysteresis-retained`, `not-ready`, `stale` és `closed` piacokat.
+  `hysteresis-retained`, `not-ready`, `not-renderable`, `stale` és `closed`
+  piacokat. A direct collector a normal collectorral azonosan kizárja a nem
+  `OPEN` vagy végrehajtható lay-ár nélküli piacot.
 - A socket-tömörítéshez három egymást követő nyomásciklus és két sikeres
   tömörítés között 5 perces cooldown kell.
 
@@ -519,7 +537,7 @@ A forráskód CDP-alapértéke `9222`; a `headless_primary.ps1` induláskor mind
 | `VEGAS_MATCHED_REFRESH_MS` | `5000` |
 | `VEGAS_CATALOGUE_REFRESH_MS` | `300000` |
 | `VEGAS_REQUEST_TIMEOUT_MS` | `15000` |
-| `VEGAS_LIVE_REQUEST_TIMEOUT_MS` | `4000` |
+| `VEGAS_LIVE_REQUEST_TIMEOUT_MS` | `3000` |
 | `VEGAS_TIMEZONE_OFFSET_MINUTES` | nincs; runtime időzóna |
 | `SHARPX_OUTPUT_FILE` | `data\combined_odds.txt` |
 | `SUREBETS_OUTPUT_FILE` | `data\football\surebets_live_odds.txt` |
@@ -575,7 +593,7 @@ Implemented since the previous audit:
   temporarily omits `startTime` or status. The snapshot exposes optional
   `snapshotConsistency.recoveredEvents`; genuinely incomplete events without a
   previous complete record still fail closed.
-- Vegas uses `VEGAS_LIVE_REQUEST_TIMEOUT_MS=4000` for fast live retries while
+- Vegas uses `VEGAS_LIVE_REQUEST_TIMEOUT_MS=3000` for fast live retries while
   catalogue/detail requests retain the 15-second generic timeout.
 - `start_all_direct_shadow_test.ps1` and
   `start_sharpx_direct_shadow_test.ps1` remain watchdogs until the shared

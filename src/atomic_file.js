@@ -1,4 +1,5 @@
 import { promises as fs, readFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
 import { randomUUID } from "node:crypto";
@@ -77,11 +78,32 @@ export async function writeTextAtomically(
   }
 }
 
-function processIsAlive(pid) {
+function getProcessImageName(pid) {
+  try {
+    if (process.platform === "win32") {
+      const output = execFileSync(
+        "tasklist.exe",
+        ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"],
+        { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
+      );
+      const match = output.match(/^"([^"]+)"\s*,\s*"(\d+)"/m);
+      return match?.[1]?.toLowerCase() ?? null;
+    }
+    return readFileSync(`/proc/${pid}/comm`, "utf8").trim().toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+
+function processIsAlive(pid, expectedImageName = path.basename(process.execPath).toLowerCase()) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
   try {
     process.kill(pid, 0);
-    return true;
+    const actualImageName = getProcessImageName(pid);
+    // A PID can be reused by an unrelated process. The image-name check keeps
+    // an old Node lock from blocking a new monitor after such a reuse.
+    return !actualImageName || actualImageName === expectedImageName;
   } catch (error) {
     return error?.code === "EPERM";
   }
@@ -99,6 +121,7 @@ export async function acquireWriterLock(outputFile, label) {
       const record = {
         token,
         pid: process.pid,
+        processName: path.basename(process.execPath).toLowerCase(),
         label,
         outputFile,
         acquiredAt: new Date().toISOString(),
@@ -139,7 +162,7 @@ export async function acquireWriterLock(outputFile, label) {
       } catch {
         // Félbemaradt lock-rekord: az alábbi stale eltávolítás kezeli.
       }
-      if (processIsAlive(Number(owner?.pid))) {
+      if (processIsAlive(Number(owner?.pid), owner?.processName ?? path.basename(process.execPath).toLowerCase())) {
         throw new Error(
           `${label} már írja ezt az outputot (PID ${owner.pid}): ${outputFile}`,
         );
