@@ -14,6 +14,14 @@ import { browserCollectorSource } from "../src/tippmixpro_odds_monitor.js";
 const delay = milliseconds =>
   new Promise(resolve => setTimeout(resolve, milliseconds));
 
+async function waitFor(predicate, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("A tesztfeltétel nem teljesült időben.");
+    await delay(5);
+  }
+}
+
 class FakeWebSocket {
   static CONNECTING = 0;
   static OPEN = 1;
@@ -163,7 +171,11 @@ test("Tippmix collector: timed-out RPCs retry and late RESULT frames are ignored
   const firstCall = JSON.parse(socket.sent.at(-1));
   const firstRequestId = firstCall[1];
 
-  await delay(35);
+  await waitFor(() =>
+    collector.rpcTimeouts === 1
+    && collector.catalogueRpcRetries === 1
+    && socket.sent.length >= 3,
+  );
   const secondCall = JSON.parse(socket.sent.at(-1));
   const secondRequestId = secondCall[1];
   assert.notEqual(secondRequestId, firstRequestId);
@@ -197,8 +209,7 @@ test("Tippmix collector: timed-out initialDump is cleaned up and late RESULT is 
   const initialDump = JSON.parse(socket.sent.at(-1));
   assert.equal(initialDump[0], 48);
 
-  await delay(35);
-  assert.equal(collector.pendingCalls.has(initialDump[1]), false);
+  await waitFor(() => !collector.pendingCalls.has(initialDump[1]));
   socket.receive([50, initialDump[1], {}, {}, { records: [{ _type: "MATCH", id: "late-dump" }] }]);
   assert.equal(collector.matches.has("late-dump"), false);
   assert.equal(collector.expiredRequestIds.size, 0);
@@ -285,6 +296,31 @@ test("writer lock: a second live owner is rejected, then succeeds after release"
   await secondLock.release();
   secondLock = null;
   await assert.rejects(fs.access(`${output}.lock`), { code: "ENOENT" });
+});
+
+test("writer lock: a legacy PID 1 lock from a previous container is reclaimed", async t => {
+  const directory = await makeTemporaryDirectory(t);
+  const output = path.join(directory, "container-output.txt");
+  const lockFile = `${output}.lock`;
+  const staleAcquiredAt = new Date(
+    Date.now() - Math.ceil(process.uptime() * 1_000) - 1_000,
+  ).toISOString();
+
+  await fs.writeFile(
+    lockFile,
+    `${JSON.stringify({
+      pid: process.pid,
+      processName: path.basename(process.execPath).toLowerCase(),
+      label: "previous container",
+      outputFile: output,
+      acquiredAt: staleAcquiredAt,
+    })}\n`,
+    "utf8",
+  );
+
+  const lock = await acquireWriterLock(output, "new container");
+  t.after(() => lock.release());
+  assert.equal(typeof lock.release, "function");
 });
 
 test("writer lock set: a partial acquisition rolls every acquired lock back", async t => {

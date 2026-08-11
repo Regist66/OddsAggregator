@@ -11,3 +11,6 @@ WORKDIR /app
 COPY src ./src
 COPY config ./config
 COPY infra/docker/start-chrome.mjs /usr/local/bin/start-chrome.mjs
+COPY infra/docker/chrome-healthcheck.mjs /usr/local/bin/chrome-healthcheck.mjs
+COPY infra/docker/monitor-healthcheck.mjs /usr/local/bin/monitor-healthcheck.mjs
+COPY infra/docker/monitor-supervisor.mjs /usr/local/bin/monitor-supervisor.mjs

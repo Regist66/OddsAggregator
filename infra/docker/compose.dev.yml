@@ -1,0 +1,19 @@
+name: oddsaggregator-dev
+
+services:
+  dev:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.dev
+    image: oddsaggregator-dev:local
+    working_dir: /workspace
+    init: true
+    stdin_open: true
+    tty: true
+    volumes:
+      - ../..:/workspace
+      - oddsaggregator-dev-node-modules:/workspace/node_modules
+    command: ["node", "--test"]
+
+volumes:
+  oddsaggregator-dev-node-modules:

@@ -1,0 +1,86 @@
+name: oddsaggregator-direct
+
+services:
+  sharpx-direct:
+    image: oddsaggregator-headless:local
+    container_name: oddsaggregator-direct-sharpx
+    network_mode: "container:pia-gluetun"
+    working_dir: /workspace
+    volumes:
+      - ../../src:/workspace/src:ro
+      - ../../config:/workspace/config:ro
+      - ../../runtime/direct-primary:/workspace/runtime/direct-primary
+    environment:
+      DIRECT_DURATION_HOURS: "${DIRECT_DURATION_HOURS:-0}"
+    command:
+      - node
+      - src/sharpx_direct_shadow.js
+      - --output-file
+      - /workspace/runtime/direct-primary/sharpx_raw_snapshot.json
+      - --duration-hours
+      - "${DIRECT_DURATION_HOURS:-0}"
+
+  tippmixpro-direct:
+    image: oddsaggregator-headless:local
+    container_name: oddsaggregator-direct-tippmixpro
+    network_mode: "container:pia-gluetun"
+    working_dir: /workspace
+    depends_on:
+      - sharpx-direct
+    volumes:
+      - ../../src:/workspace/src:ro
+      - ../../config:/workspace/config:ro
+      - ../../runtime/direct-primary:/workspace/runtime/direct-primary
+    command:
+      - node
+      - src/tippmixpro_direct_shadow.js
+      - --output-file
+      - /workspace/runtime/direct-primary/tippmixpro_raw_snapshot.json
+      - --duration-hours
+      - "${DIRECT_DURATION_HOURS:-0}"
+
+  vegas-direct:
+    image: oddsaggregator-headless:local
+    container_name: oddsaggregator-direct-vegas
+    network_mode: "container:pia-gluetun"
+    working_dir: /workspace
+    depends_on:
+      - sharpx-direct
+    volumes:
+      - ../../src:/workspace/src:ro
+      - ../../config:/workspace/config:ro
+      - ../../runtime/direct-primary:/workspace/runtime/direct-primary
+    command:
+      - node
+      - src/vegas_direct_shadow.js
+      - --output-file
+      - /workspace/runtime/direct-primary/vegas_raw_snapshot.json
+      - --watchlist-file
+      - /workspace/runtime/direct-primary/sharpx_raw_snapshot.json
+      - --duration-hours
+      - "${DIRECT_DURATION_HOURS:-0}"
+
+  aggregator:
+    image: oddsaggregator-headless:local
+    container_name: oddsaggregator-direct-aggregator
+    working_dir: /workspace
+    depends_on:
+      - sharpx-direct
+      - tippmixpro-direct
+      - vegas-direct
+    volumes:
+      - ../../src:/workspace/src:ro
+      - ../../config:/workspace/config:ro
+      - ../../runtime/direct-primary:/workspace/runtime/direct-primary
+    environment:
+      DIRECT_PRIMARY_DURATION_HOURS: "${DIRECT_DURATION_HOURS:-0}"
+      DIRECT_SHARPX_SNAPSHOT_FILE: /workspace/runtime/direct-primary/sharpx_raw_snapshot.json
+      DIRECT_TIPPMIXPRO_SNAPSHOT_FILE: /workspace/runtime/direct-primary/tippmixpro_raw_snapshot.json
+      DIRECT_VEGAS_SNAPSHOT_FILE: /workspace/runtime/direct-primary/vegas_raw_snapshot.json
+      DIRECT_PRIMARY_OUTPUT_FILE: /workspace/runtime/direct-primary/combined_odds.txt
+      DIRECT_PRIMARY_SUREBETS_OUTPUT_FILE: /workspace/runtime/direct-primary/football/surebets_live_odds.txt
+      DIRECT_PRIMARY_WATCHLIST_FILE: /workspace/runtime/direct-primary/sharpx_watchlist.json
+      DIRECT_PRIMARY_STATUS_FILE: /workspace/runtime/direct-primary/sharpx_status_snapshot.json
+      DIRECT_PRIMARY_HEALTH_FILE: /workspace/runtime/direct-primary/direct_primary_health.json
+      TEAM_ALIASES_FILE: /workspace/config/team_aliases.json
+    command: ["node", "src/direct_primary_aggregator.js"]

@@ -148,6 +148,14 @@ class CdpClient {
       const timer = setTimeout(() => {
         if (!this.pending.delete(id)) return;
         reject(new Error(`SharpX CDP parancs időtúllépés: ${method}`));
+        // A Runtime.evaluate a böngészőben ettől még futhatna tovább. Zárjuk
+        // le a hibás CDP-csatornát, hogy a recovery új, tiszta target-kapcsolatot
+        // hozzon létre, és ne torlódjanak rá új kérések a régi socketre.
+        try {
+          this.socket?.close();
+        } catch {
+          // A socket már bezáródhatott a timeouttal párhuzamosan.
+        }
       }, CONFIG.cdpCommandTimeoutMs);
       this.pending.set(id, { resolve, reject, timer });
     });
@@ -659,7 +667,7 @@ function teamAliasKey(value) {
     .trim();
 }
 
-async function refreshTeamAliases() {
+export async function refreshTeamAliases() {
   let stats;
   try {
     stats = await fs.stat(CONFIG.teamAliasesFile);
@@ -875,7 +883,7 @@ export function sameEventPhase(market, event, liveProperty) {
   return market.inPlay === event[liveProperty];
 }
 
-function renderSummary(snapshot, tippmixSnapshot, vegasSnapshot) {
+export function renderSummary(snapshot, tippmixSnapshot, vegasSnapshot) {
   const lines = [`*** ${formatTimestamp(snapshot.generatedAt)} ***`, ""];
   const tippmixEvents = Array.isArray(tippmixSnapshot?.events)
     ? tippmixSnapshot.events
@@ -988,7 +996,7 @@ function hasSurebet(layOdds, bookmakerOdds) {
   );
 }
 
-function renderSurebets(snapshot, tippmixSnapshot, vegasSnapshot) {
+export function renderSurebets(snapshot, tippmixSnapshot, vegasSnapshot) {
   const lines = [
     `*** SURE BETS - ${formatTimestamp(snapshot.generatedAt)} ***`,
     "",
@@ -1076,7 +1084,7 @@ function renderedBodyLines(content) {
   return lines.length >= 3 ? lines.slice(2, -1) : [];
 }
 
-function composeRenderedOutput(header, ...contents) {
+export function composeRenderedOutput(header, ...contents) {
   const lines = [header, ""];
   for (const content of contents) lines.push(...renderedBodyLines(content));
   return `${lines.join("\r\n")}\r\n`.replaceAll("\u00e2\u201a\u00ac", "\u20ac");
@@ -1235,7 +1243,7 @@ export function assessVegasSnapshot(snapshot, options = {}) {
   };
 }
 
-function createWatchlist(snapshot) {
+export function createWatchlist(snapshot) {
   return {
     generatedAt: snapshot.generatedAt,
     events: snapshot.markets.map(market => {
@@ -1256,7 +1264,7 @@ function createWatchlist(snapshot) {
   };
 }
 
-function createStatusSnapshot(snapshot) {
+export function createStatusSnapshot(snapshot) {
   return {
     generatedAt: snapshot.generatedAt,
     generation: snapshot.generation,
@@ -1321,6 +1329,7 @@ async function main() {
   let lastOutputStatus = "";
   let lastBookmakerHealthStatus = "";
   let recoveryPromise = null;
+  let refreshingCatalogue = false;
   let prematchCache = null;
 
   const connectCdp = async (force = false) => {
@@ -1384,8 +1393,9 @@ async function main() {
   };
 
   const refreshCatalogue = async () => {
+    if (recoveryPromise || refreshingCatalogue || writing || stopping) return;
+    refreshingCatalogue = true;
     try {
-      if (recoveryPromise) return;
       const result = await cdp.evaluate(browserRefreshCatalogueSource, contextId);
       console.log(
         `[catalogue] total=${result.catalogueMarkets} selected=${result.selectedMarkets} live=${result.liveMarkets}`,
@@ -1398,11 +1408,13 @@ async function main() {
         console.error(`[recovery] ${recoveryError.message}`);
         await stop(1);
       }
+    } finally {
+      refreshingCatalogue = false;
     }
   };
 
   const writeOutput = async () => {
-    if (writing || stopping || recoveryPromise) return;
+    if (writing || stopping || recoveryPromise || refreshingCatalogue) return;
     writing = true;
     try {
       const snapshot = await cdp.evaluate(browserGetSnapshotSource, contextId);

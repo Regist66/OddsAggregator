@@ -81,6 +81,11 @@ class CdpClient {
       const timer = setTimeout(() => {
         if (!this.pending.delete(id)) return;
         reject(new Error(`TippmixPro CDP parancs időtúllépés: ${method}`));
+        try {
+          this.socket?.close();
+        } catch {
+          // A socket már bezáródhatott a timeouttal párhuzamosan.
+        }
       }, CONFIG.cdpCommandTimeoutMs);
       this.pending.set(id, { resolve, reject, timer });
     });
@@ -972,6 +977,7 @@ async function main() {
   let writing = false;
   let lastStatus = "";
   let recoveryPromise = null;
+  let refreshingCatalogue = false;
 
   const connectCdp = async (force = false) => {
     if (!force && cdp?.socket?.readyState === WebSocket.OPEN) return;
@@ -988,13 +994,15 @@ async function main() {
     stopping = true;
     clearInterval(catalogueTimer);
     clearInterval(outputTimer);
+    // Release the bind-mounted lock before the CDP cleanup can hit its
+    // timeout. Docker may otherwise SIGKILL the process with the lock held.
+    await writerLock.release();
     try {
       if (contextId && cdp) await cdp.evaluate(browserShutdownSource, contextId, false);
     } catch {
       // A böngésző vagy az iframe ekkor már bezáródhatott.
     }
     cdp?.close();
-    await writerLock.release();
     process.exitCode = exitCode;
   };
 
@@ -1032,8 +1040,9 @@ async function main() {
   };
 
   const refresh = async () => {
+    if (recoveryPromise || refreshingCatalogue || writing || stopping) return;
+    refreshingCatalogue = true;
     try {
-      if (recoveryPromise) return;
       const result = await cdp.evaluate(browserRefreshSource, contextId);
       console.log(
         `[catalogue] tournaments=${result.tournamentIds} topics=${result.subscribedTopics}`,
@@ -1046,11 +1055,13 @@ async function main() {
         console.error(`[recovery] ${recoveryError.message}`);
         await stop(1);
       }
+    } finally {
+      refreshingCatalogue = false;
     }
   };
 
   const writeOutput = async () => {
-    if (writing || stopping || recoveryPromise) return;
+    if (writing || stopping || recoveryPromise || refreshingCatalogue) return;
     writing = true;
     try {
       const snapshot = await cdp.evaluate(browserSnapshotSource, contextId);

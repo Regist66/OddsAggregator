@@ -1,0 +1,9 @@
+FROM node:24.18.0-bookworm-slim
+
+WORKDIR /workspace
+
+ENV NODE_ENV=development
+
+# The repository is mounted by compose.dev.yml. Keeping the image source-free
+# makes the edit-test loop independent from image rebuilds.
+CMD ["node", "--test"]

@@ -123,6 +123,11 @@ class CdpClient {
       const timer = setTimeout(() => {
         if (!this.pending.delete(id)) return;
         reject(new Error(`Vegas CDP parancs időtúllépés: ${method}`));
+        try {
+          this.socket?.close();
+        } catch {
+          // A socket már bezáródhatott a timeouttal párhuzamosan.
+        }
       }, CONFIG.cdpCommandTimeoutMs);
       this.pending.set(id, { resolve, reject, timer });
     });
@@ -829,13 +834,15 @@ async function main() {
     stopping = true;
     clearInterval(outputTimer);
     clearInterval(matchedRefreshTimer);
+    // Release the bind-mounted lock before the CDP cleanup can hit its
+    // timeout. Docker may otherwise SIGKILL the process with the lock held.
+    await writerLock.release();
     try {
       if (contextId && cdp) await cdp.evaluate(browserShutdownSource, contextId, false);
     } catch {
       // A böngésző ekkor már bezáródhatott.
     }
     cdp?.close();
-    await writerLock.release();
     process.exitCode = exitCode;
   };
 
@@ -882,7 +889,7 @@ async function main() {
   };
 
   const refreshMatchedEvents = async () => {
-    if (refreshingMatchedEvents || stopping) return;
+    if (refreshingMatchedEvents || stopping || writing || initializationPromise) return;
     refreshingMatchedEvents = true;
     try {
       await refreshTeamAliases();
@@ -920,7 +927,7 @@ async function main() {
   };
 
   const writeOutput = async () => {
-    if (writing || stopping) return;
+    if (writing || stopping || refreshingMatchedEvents || initializationPromise) return;
     writing = true;
     try {
       const snapshot = await cdp.evaluate(

@@ -14,6 +14,11 @@ const TRANSIENT_REPLACE_ERRORS = new Set([
   "EPERM",
 ]);
 
+// A container restart can reuse PID 1 while the bind-mounted lock file
+// survives. The instance id distinguishes that process from the previous one.
+const PROCESS_INSTANCE_ID = randomUUID();
+const PROCESS_STARTED_AT_MS = Date.now() - Math.round(process.uptime() * 1_000);
+
 export class AtomicWriteError extends Error {
   constructor(filename, cause) {
     super(`Az output nem cserélhető atomikusan: ${filename}: ${cause.message}`, {
@@ -95,14 +100,24 @@ function getProcessImageName(pid) {
   }
 }
 
-function processIsAlive(pid, expectedImageName = path.basename(process.execPath).toLowerCase()) {
+function processIsAlive(pid, owner = {}) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
-  if (pid === process.pid) return true;
+  if (pid === process.pid) {
+    if (owner.processInstanceId) {
+      return owner.processInstanceId === PROCESS_INSTANCE_ID;
+    }
+    // Legacy lock records have no instance id. Their timestamp still lets us
+    // recognize a lock left by the previous process when PID 1 was reused.
+    const acquiredAt = Date.parse(owner.acquiredAt);
+    return !Number.isFinite(acquiredAt) || acquiredAt >= PROCESS_STARTED_AT_MS;
+  }
   try {
     process.kill(pid, 0);
     const actualImageName = getProcessImageName(pid);
     // A PID can be reused by an unrelated process. The image-name check keeps
     // an old Node lock from blocking a new monitor after such a reuse.
+    const expectedImageName =
+      owner.processName ?? path.basename(process.execPath).toLowerCase();
     return !actualImageName || actualImageName === expectedImageName;
   } catch (error) {
     return error?.code === "EPERM";
@@ -122,6 +137,8 @@ export async function acquireWriterLock(outputFile, label) {
         token,
         pid: process.pid,
         processName: path.basename(process.execPath).toLowerCase(),
+        processInstanceId: PROCESS_INSTANCE_ID,
+        processStartedAt: new Date(PROCESS_STARTED_AT_MS).toISOString(),
         label,
         outputFile,
         acquiredAt: new Date().toISOString(),
@@ -162,7 +179,7 @@ export async function acquireWriterLock(outputFile, label) {
       } catch {
         // Félbemaradt lock-rekord: az alábbi stale eltávolítás kezeli.
       }
-      if (processIsAlive(Number(owner?.pid), owner?.processName ?? path.basename(process.execPath).toLowerCase())) {
+      if (processIsAlive(Number(owner?.pid), owner ?? {})) {
         throw new Error(
           `${label} már írja ezt az outputot (PID ${owner.pid}): ${outputFile}`,
         );

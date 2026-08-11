@@ -1,9 +1,108 @@
 # OddsAggregator – projektkontextus és session handoff
 
-> Utolsó érdemi frissítés: 2026-08-07. Az aktuális üzemi választás a headless
-> primary stack a `9333` CDP-porton. A review ellenőrzésekor a stack nem futott,
-> ezért valós hálózati smoke teszt nem történt; az állapot minden session elején
-> újra ellenőrizendő.
+> Utolsó érdemi frissítés: 2026-08-11. Az aktuális üzemi referencia a Dockeres
+> headless composition; a fokozatos direct production átállás még nincs
+> végrehajtva. A 2026-08-11-i kétórás párhuzamos futás infrastruktúra-szinten
+> stabil volt, de a Vegas headless/direct tartalmi paritás még nem release-kész.
+> Új session elején a futó containereket, a `pia-gluetun` health-et és a friss
+> kimeneteket mindig újra ellenőrizni kell.
+
+## Aktuális handoff röviden – 2026-08-11
+
+Az aktuális Linux/WSL környezetben a production stack Docker Compose alatt fut.
+A Docker Desktop/WSL RAM-keretét a felhasználó legalább 4 GiB-ra emelte; a
+futás közben látható Docker-konténerlimit körülbelül 3,825 GiB volt. A headless
+Chrome-os production monitorok és a `pia-gluetun` a legutóbbi kétórás tesztben
+végig `running/healthy` állapotban maradtak, újraindítás és OOM nélkül.
+
+A közvetlen stack jelenlegi compose-fájlja az
+`infra/docker/compose.direct.yml`. Ez már mindhárom direct collectort és a
+direct aggregátort tartalmazza, de még shadow/test jellegű kimenetet ír a
+`runtime/direct-primary/` könyvtárba. Production writerként csak külön
+hardening után használható; a kanonikus `data/` kimeneteket egyszerre csak egy
+aktív stack írhatja.
+
+Dockerben a host oldali kanonikus volume-ok tényleges helye jelenleg
+`runtime/data/`; a dokumentum régebbi Windows-szakaszai rövidségből gyakran
+`data/` néven hivatkoznak rá. Új Dockeres ellenőrzésnél mindig az aktuális
+`infra/docker/compose.yml` volume mappingje az elsődleges.
+
+A teljes legutóbbi mérés a
+`runtime/direct-primary/parity/20260811-124950/` könyvtárban van. Ez a
+headless Docker production stack mellett futó, körülbelül 120 perces direct
+teszt volt. A direct futtatóhoz a párhuzamosságot szándékosan engedélyezni
+kellett:
+
+Providerenkénti összefoglalók: [SharpX](../runtime/direct-primary/parity/20260811-124950/sharpx/summary.json),
+[TippmixPro](../runtime/direct-primary/parity/20260811-124950/tippmixpro/summary.json),
+[Vegas](../runtime/direct-primary/parity/20260811-124950/vegas/summary.json).
+
+```bash
+ALLOW_PARALLEL_DIRECT=1 ./infra/docker/start-direct.sh 120
+```
+
+Az `ALLOW_PARALLEL_DIRECT=1` kizárólag összehasonlító teszthez való; állandó
+production indítási mechanizmusként nem szabad használni.
+
+### A kétórás futás eredménye
+
+- A production Chrome, SharpX, TippmixPro és Vegas containerek végig healthy-k
+  maradtak; nem volt restart vagy OOM.
+- A `pia-gluetun` végig healthy maradt; nem volt restart vagy OOM.
+- A direct collectorkonténerek a közös kétórás deadline után szabályosan
+  kiléptek (`restart=0`, `oom=false`); ez a duration teszt elvárt vége, nem
+  hiba.
+- A memória stabil volt, növekvő leak jele nélkül: Chrome tipikusan
+  550–610 MiB, direct aggregátor 170–195 MiB, direct TippmixPro körülbelül
+  200–245 MiB.
+- A direct futás végi health minden forrásnál `ok=true`, `state=fresh`,
+  `error=null` volt, a fájlkorok 1 másodperc alatt maradtak. Végső mérőszámok:
+  SharpX 526 market, TippmixPro 1031 event, Vegas 149 effective event.
+- A direct outputok a futás végén is frissültek, a headless production outputok
+  pedig a direct teszt befejezése után is folytatták a frissülést.
+
+### Tartalmi paritás
+
+| Forrás | Értékelhető minta | Odds-egyezés | Fő eltérés | Döntés |
+|---|---:|---:|---|---|
+| SharpX | 6866/7138 | 6343 időzítési tolerancia, 4668 megerősített eltérés | azonos `apiPt` mellett 0 eltérő odds; coverage- és snapshot-skew-ablakok | erős szemantikai egyezés, további canary kell |
+| TippmixPro | 6887/7030 (98,39%) | 99,9811% | direct oldalon legfeljebb 16 extra event, readiness/freshness nem 100% | jó jelölt a második átállásra |
+| Vegas | 6745/7140 (94,87%) | 99,8504% | legfeljebb 329 direct-only event, 47 nagy coverage-epizód; ismétlődő freshness/skew ablakok | direct ígéretesebb, de szigorú paritásra még nem kész |
+
+Részletes eredmények:
+
+- SharpX: `rawOddsMismatches=11011`, ebből `timingToleratedOdds=6343`,
+  `confirmedOddsMismatches=4668`; `sameApiPtDifferentOdds=0` és
+  `sameTimestampDifferentOdds=0`. Az eltérések főleg nem azonos időpillanatban
+  készült snapshotokból erednek.
+- TippmixPro: 7 022 701 összevetett oddsértékből 7 021 371 egyezett. A status
+  egyezés 100%, az in-play egyezés 100%; a direct snapshot általában legfeljebb
+  16 eseménnyel bővebb.
+- Vegas: 2 782 396 összevetett oddsértékből 2 778 234 egyezett; az összes mező
+  egyezése 99,7764%. A nagy eltérés nem elsősorban oddsérték-probléma, hanem a
+  kiválasztott események időszakos coverage/freshness eltérése.
+
+### Vegas diagnózis: nem elsődlegesen RAM- vagy VPN-probléma
+
+A headless Vegas logokban a normál kiválasztott/live output jellemzően
+403–417 event volt, majd rövid időre 121, 289, 162, 88 vagy 181 eventre esett,
+miközben a teljes katalógus körülbelül 868–886 eventet és 3–9 live eventet
+továbbra is látott. Néhány másodpercen belül visszaállt a korábbi szint.
+Mivel közben nem volt container restart, OOM, Gluetun-hiba vagy tartós hálózati
+kimaradás, a legerősebb jelenlegi hipotézis a kiválasztási állapot és az output
+publikálása közötti race:
+
+1. `src/vegas_odds_monitor.js` `refreshMatchedEvents()` a célzott frissítés
+   befejezése előtt lecseréli a `selectedIds` értékét.
+2. A `writeOutput()` a frissítés alatt kihagyható, utána pedig az éppen aktuális
+   `selectedIds` alapján szűri a snapshotot.
+3. Egy rövid selection-refresh/targeted-refresh átmenet ezért hiányos
+   selected/live snapshotot publikálhat, miközben a katalógus elérhető.
+
+Ez magyarázza, hogy a Vegas direct path tartósabban és nagyobb coverage-dzsel
+néz ki, miközben a direct comparator saját freshness-ablakokat is mutatott. A
+direct nem tekinthető automatikusan hibátlannak; a Vegasnál a provider-health,
+coverage és output freshness külön kapu kell legyen.
 
 A 2026-08-07-i priorizált találatlista és implementációs állapot:
 `docs\REVIEW_2026-08-07.md`.
@@ -13,6 +112,10 @@ A 2026-08-07-i priorizált találatlista és implementációs állapot:
 Projektgyökér:
 
 `C:\Users\regai\Projects\OddsAggregator`
+
+Aktuális Linux/WSL munkakönyvtár:
+
+`/home/jimmy/VSProjects/OddsAggregator`
 
 A rendszer a SharpX, TippmixPro és Vegas publikus labdarúgó Match Odds / rendes
 játékidős 1X2 kínálatát gyűjti, párosítja és írja ki. Nem jelentkezik be, nem ad
@@ -440,18 +543,34 @@ readiness/recovery védelmet, restart-féket, tartalmi health gate-et és bőví
 diagnosztikát. A jelenlegi verzióval még nem futott új smoke vagy hosszabb
 validáció; a régi 7 órás eredmény ezért nem használható release-elfogadásként.
 
-## Következő lépések
+## Következő lépések – fokozatos direct production átállás
 
-1. A jelenlegi SharpX collector/comparator 15 perces smoke tesztje a
-   `pia-gluetun` útvonalon.
-2. Sikeres smoke után legalább 2 órás, lehetőleg élő meccsekkel terhelt SharpX
-   validáció.
-3. Új közös háromforrásos validáció a provider comparatorok tartalmi metrikáival;
-   csak ezután direct-primary és kanonikus combined/surebet kimenet tervezése.
-4. Run-manifest alapú egységes direct `Status`/`Stop` és futás közbeni watchdog.
-5. Frame-age alapú, cooldownnal védett célzott provider-reconnect soak teszttel.
-6. A név- és időalapú matching kétértelmű eseteinek mérése és fixture-alapú
-   regressziós tesztje.
+1. Külön direct-production Compose/profile létrehozása a jelenlegi shadow
+   compose alapján. A véges smoke duration, a tesztkimenet és a
+   `ALLOW_PARALLEL_DIRECT=1` nem kerülhet át változtatás nélkül productionbe.
+2. Production hardening: `restart: unless-stopped`, heartbeat- és output-
+   freshness healthcheck, watchdog/supervisor, konténerenkénti logolás,
+   egységes `Status`/`Stop`, valamint közös run-manifest vagy állapotfájl.
+3. Active/passive kimeneti könyvtár és atomikus snapshot-promóció kialakítása.
+   Incomplete vagy stale direct snapshot nem írhatja felül az utolsó
+   last-known-good kanonikus kimenetet; legyen automatikus rollback headlessre.
+4. Providerenkénti coverage/freshness gate és riasztás bevezetése. Vegasnál a
+   headless comparator-paritás nem lehet egyedüli gate, mert a headless oldalon
+   ismert selected-ID/output race van.
+5. Vegas direct 24 órás canary: direct passzív kimenet, headless aktív
+   fallback. Siker esetén csak Vegas output ownership váltson directre.
+6. TippmixPro direct canary, majd SharpX direct canary. A javasolt sorrend:
+   Vegas → TippmixPro → SharpX, mert Vegasnál a legnagyobb a headless coverage-
+   előny, TippmixPro tartalmi egyezése nagyon erős, SharpX-nél pedig a socket-
+   és subscription-átmenetek igényelnek még óvatosabb validációt.
+7. Mindhárom provider sikeres canaryja után lehet a Chrome production stack
+   kivezetését mérlegelni. Addig a headless maradjon visszaállítható fallback.
+
+Egyedi provider-canary esetén kezelni kell a SharpX-watchlist függőséget: a
+direct Vegas jelenlegi futtatója a direct SharpX snapshotból dolgozik. Ha csak
+Vegas ownership vált, akkor vagy a direct SharpX fusson passzívan, vagy a Vegas
+direct explicit módon a headless kanonikus watchlistet kapja. Két aktív writer
+ugyanazt a `data\` fájlt nem írhatja.
 
 ## Gyakori ellenőrzések új sessionben
 
@@ -580,7 +699,10 @@ A direct SharpX és comparator részletes CLI-alapértékei a fájlok elején l�
 | `..\SurebetManager\` | Külső testvérprojekt, `main_qt.py` GUI |
 | `/home/jimmy/pia-vpn` | Külső WSL PIA/Gluetun konfiguráció |
 
-## Session handoff – 2026-08-08
+## Korábbi session handoff – 2026-08-08 (történeti)
+
+Az alábbi szakasz a 2026-08-08-i állapotot rögzíti; a 2026-08-11-i mérés és a
+következő fejezet az elsődleges aktuális handoff.
 
 The latest implementation is in commits `d26ff3f` and `a8fed29`.
 
@@ -634,6 +756,77 @@ though no persistent coverage evidence appeared. Start with:
 At the end, require `status: completed`, zero comparator/collector stderr,
 zero persistent SharpX presence/odds evidence, and investigate any continued
 SharpX `snapshot-skew-high` rate before spending eight hours on a soak run.
+
+## Aktuális session handoff – direct migráció előkészítése (2026-08-11)
+
+### Release- és migrációs döntés
+
+A kétórás futás alapján az infrastruktúra és a direct adatút működőképes, ezért
+a direct production irány indokolt. Nem indokolt azonban mindhárom monitort
+egyszerre átkapcsolni, és a jelenlegi `compose.direct.yml` még nem tekinthető
+production compose-nak.
+
+Az első éles canary legyen Vegas direct, 24 órás passzív összevetéssel és
+headless fallbackkel. A sikeres Vegas canary után TippmixPro, végül SharpX
+következzen. A Chrome csak akkor vezethető ki, ha mindhárom direct provider
+külön canaryja sikeres és az összes kanonikus output ownership egyértelmű.
+
+### Kötelező implementációs elemek a következő sessionben
+
+- A `infra/docker/compose.direct.yml`-ből külön, végtelen futásra szánt
+  direct-production konfiguráció/profil készüljön. A `DIRECT_DURATION_HOURS=0`
+  lehet a folyamatos futás jelzése, de a health/restart/rollback viselkedést
+  explicit módon kell megadni.
+- A direct collectorok és az aggregátor kapjanak `restart: unless-stopped`
+  policyt, saját heartbeat/output freshness healthchecket és watchdogot.
+- A collector ne közvetlenül a kanonikus `data\` fájlokat írja. Először teljes
+  staging snapshot készüljön, majd ellenőrzött, atomikus promócióval váljon
+  aktívvá. Promóciós hiba vagy freshness/coverage-gate hiba esetén maradjon az
+  előző last-known-good snapshot.
+- Legyen providerenként aktív/passzív állapot, coverage gate, stale-output
+  riasztás és explicit rollback. A rollback ne indítsa el véletlenül a direct
+  és headless kettős writerét.
+- A direct Vegas kapjon világos watchlist-forrást a canaryhoz: vagy a direct
+  SharpX passzív snapshotját használja, vagy külön, dokumentált headless
+  watchlist-inputot. A két út összevonása implicit fájlcserével kerülendő.
+- A deployment előtt fusson statikus ellenőrzés és legalább egy rövid smoke;
+  ezután Vegas 24 óra, majd providerenként 24 óra canary. A végső acceptance
+  ne csak odds-egyezést, hanem output freshness-t, coverage-t, restart/OOM-ot,
+  source-health-et és rollback-képességet is mérjen.
+
+### Javasolt canary-gates
+
+Minden provider csak akkor válhat aktívvá, ha a saját canaryja alatt nincs
+nem tervezett restart/OOM, nincs tartós `pia-gluetun`- vagy source-health hiba,
+a kanonikus output a megengedett TTL-en belül frissül, és nincs ismeretlen
+coverage-zuhanás. A comparator readiness csak diagnosztikai és provider-
+specifikus gate legyen:
+
+- SharpX-nél külön kell figyelni az azonos `apiPt` melletti eltérő oddsot,
+  a persistent market-presence/odds evidence-et és a socket readiness-t.
+- TippmixPro-nál a 99,9811%-os odds-egyezés jó kiindulási referencia, de a
+  16 direct-only eventes farok és a snapshot freshness továbbra is ellenőrizendő.
+- Vegasnál a direct-only coverage önmagában nem hiba, mert a headless output
+  ismert módon rövid időre hiányos selected/live snapshotot publikál. A direct
+  oldalon viszont nem maradhat ellenőrizetlen stale/freshness-ablak.
+
+### Új session első ellenőrzései
+
+```bash
+git status --short
+docker compose -f infra/docker/compose.yml ps
+docker inspect --format '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' \
+  oddsaggregator-chrome oddsaggregator-sharpx oddsaggregator-tippmixpro \
+  oddsaggregator-vegas pia-gluetun
+./infra/docker/status-direct.sh
+```
+
+Ezután olvasd el a direct compose-t, a `start-direct.sh`, `status-direct.sh`,
+`stop-direct.sh` lifecycle scripteket és a `src/direct_primary_aggregator.js`
+output mappingjét. A kódváltoztatások előtt ellenőrizd, hogy nincs-e más
+felhasználói módosítás a dirty worktree-ben. A jelenlegi production és direct
+stacket ne állítsd át automatikusan; az első implementációs lépés a külön
+direct-production profile és a staging/rollback mechanizmus legyen.
 
 ## Git/worktree állapot
 

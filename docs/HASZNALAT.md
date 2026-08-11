@@ -3,10 +3,40 @@
 ## Követelmények
 
 - Windows és PowerShell;
-- Node.js 22 vagy újabb; a jelenlegi környezet Node.js 24-et használ;
+- Node.js 22 vagy újabb helyi futtatáshoz; Dockeres fejlesztésnél ez nem kell;
 - Chrome távoli hibakeresési porttal: `9222`;
 - működő SOCKS5 proxy: `127.0.0.1:1080`;
 - három megnyitott sportoldal: SharpX, TippmixPro és Vegas.
+
+## Fejlesztői környezet Dockerből
+
+A tesztekhez és a statikus ellenőrzésekhez használható külön fejlesztői image.
+Ez nem indít Chrome-ot, nem használja a `pia-gluetun` konténert, és a
+repositoryt mountolja, ezért a forráskód módosítása után nincs szükség
+újraépítésre.
+
+Teljes tesztkészlet:
+
+```powershell
+docker compose -f .\infra\docker\compose.dev.yml run --rm dev
+```
+
+Statikus ellenőrzés:
+
+```powershell
+docker compose -f .\infra\docker\compose.dev.yml run --rm dev `
+  node --check src\sharpx_odds_monitor.js
+```
+
+Interaktív shell:
+
+```powershell
+docker compose -f .\infra\docker\compose.dev.yml run --rm --entrypoint bash dev
+```
+
+Az image-et csak a Node-verzió vagy a Docker-konfiguráció módosításakor kell
+újraépíteni. A production futtatáshoz továbbra is a headless vagy direct
+indítókat használd.
 
 A projekt könyvtára:
 
@@ -115,6 +145,53 @@ felülírások:
 `--warmup-ms`, `--normal-max-content-age-ms`, `--direct-max-content-age-ms`,
 `--max-snapshot-skew-ms`, `--max-observation-gap-ms` és
 `--min-coverage-ratio`.
+
+## WSL direct primary smoke és üzemeltetés
+
+WSL alatt a Chrome-mentes primary stack Docker Compose-ból indítható. A direct
+collectorok a `pia-gluetun` hálózati névterét használják, az output aggregator
+pedig a `runtime/direct-primary/` elkülönített fájljaiba ír.
+
+```bash
+./infra/docker/start-direct.sh 15
+./infra/docker/status-direct.sh
+docker compose -f infra/docker/compose.direct.yml logs -f --tail=100
+```
+
+A 15 perces futás lejárta után az eredmények a
+`runtime/direct-primary/` alatt maradnak. A stack leállítása:
+
+```bash
+./infra/docker/stop-direct.sh
+```
+
+A `direct_primary_health.json` forrásonként mutatja a frissességet és a
+fail-closed állapotot. A headless production stack változatlanul a
+`infra/docker/compose.yml` fájllal kezelhető, ezért a direct smoke nem írja felül
+annak kanonikus kimeneteit.
+
+### Stabilitási és izolációs szabályok
+
+A production headless monitorok output-frissesség alapú supervisor alatt futnak.
+Ha egy monitor 120 másodpercig nem frissíti a heartbeat fájlját, a supervisor
+kilép, a Compose pedig az `unless-stopped` szabály szerint újraindítja a
+monitor konténert. A `docker compose ps` ezért a monitorok health állapotát is
+mutatja.
+
+A direct smoke indító alapértelmezetten megtagadja a futó production stack
+melletti indulást, mert mindkettő a `pia-gluetun` network namespace-ét használná.
+Tudatos, párhuzamos futtatás csak explicit engedéllyel indítható:
+
+```bash
+ALLOW_PARALLEL_DIRECT=1 ./infra/docker/start-direct.sh 15
+```
+
+Docker Desktop/WSL alatt legalább 4 GiB memória és 2 vCPU javasolt ehhez a
+Chrome + három monitor + VPN kombinációhoz. A Compose nem tudja növelni a
+Docker Desktop/WSL VM memóriáját; azt a host beállításaiban kell megadni.
+Ellenőrzéshez használd a `free -h`, `vmstat 1 5` és `docker stats --no-stream`
+parancsokat. A teljesen kihasznált swap és tartós memory PSI azt jelzi, hogy a
+host erőforrása továbbra is szűk.
 
 A SharpX direct collector a socket-tömörítést óvatosan végzi: alapértelmezetten
 három egymást követő katalógusciklusban fennálló alulterheltség után indítja el,

@@ -8,6 +8,8 @@ services:
     image: oddsaggregator-headless:local
     container_name: oddsaggregator-chrome
     network_mode: "container:pia-gluetun"
+    init: true
+    restart: unless-stopped
     shm_size: "1gb"
     volumes:
       - chrome-profile:/chrome-profile
@@ -16,8 +18,7 @@ services:
       test:
         - CMD
         - node
-        - -e
-        - "fetch('http://127.0.0.1:9333/json/version').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
+        - /usr/local/bin/chrome-healthcheck.mjs
       interval: 10s
       timeout: 5s
       retries: 12
@@ -27,6 +28,9 @@ services:
     image: oddsaggregator-headless:local
     container_name: oddsaggregator-tippmixpro
     network_mode: "container:pia-gluetun"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
     depends_on:
       chrome:
         condition: service_healthy
@@ -36,12 +40,25 @@ services:
       TIPPMIXPRO_CDP_ENDPOINT: http://127.0.0.1:9333
       TIPPMIXPRO_OUTPUT_FILE: /app/data/tippmixpro_odds_snapshot.json
       TIPPMIXPRO_SNAPSHOT_FILE: /app/data/tippmixpro_odds_snapshot.json
-    command: ["node", "--title=oddsaggregator-headless-primary", "src/tippmixpro_odds_monitor.js"]
+      MONITOR_HEARTBEAT_FILE: /app/data/tippmixpro_odds_snapshot.json
+      MONITOR_STALE_MS: "${MONITOR_STALE_MS:-120000}"
+      MONITOR_STARTUP_GRACE_MS: "${MONITOR_STARTUP_GRACE_MS:-180000}"
+      MONITOR_POLL_MS: "${MONITOR_POLL_MS:-10000}"
+    command: ["node", "/usr/local/bin/monitor-supervisor.mjs", "src/tippmixpro_odds_monitor.js"]
+    healthcheck:
+      test: ["CMD", "node", "/usr/local/bin/monitor-healthcheck.mjs", "/app/data/tippmixpro_odds_snapshot.json"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
 
   sharpx:
     image: oddsaggregator-headless:local
     container_name: oddsaggregator-sharpx
     network_mode: "container:pia-gluetun"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
     depends_on:
       chrome:
         condition: service_healthy
@@ -55,12 +72,25 @@ services:
       SHARPX_STATUS_SNAPSHOT_FILE: /app/data/sharpx_status_snapshot.json
       TIPPMIXPRO_SNAPSHOT_FILE: /app/data/tippmixpro_odds_snapshot.json
       VEGAS_SNAPSHOT_FILE: /app/data/vegas_odds_snapshot.json
-    command: ["node", "--title=oddsaggregator-headless-primary", "src/sharpx_odds_monitor.js"]
+      MONITOR_HEARTBEAT_FILE: /app/data/sharpx_status_snapshot.json
+      MONITOR_STALE_MS: "${MONITOR_STALE_MS:-120000}"
+      MONITOR_STARTUP_GRACE_MS: "${MONITOR_STARTUP_GRACE_MS:-180000}"
+      MONITOR_POLL_MS: "${MONITOR_POLL_MS:-10000}"
+    command: ["node", "/usr/local/bin/monitor-supervisor.mjs", "src/sharpx_odds_monitor.js"]
+    healthcheck:
+      test: ["CMD", "node", "/usr/local/bin/monitor-healthcheck.mjs", "/app/data/sharpx_status_snapshot.json"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
 
   vegas:
     image: oddsaggregator-headless:local
     container_name: oddsaggregator-vegas
     network_mode: "container:pia-gluetun"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
     depends_on:
       chrome:
         condition: service_healthy
@@ -71,7 +101,17 @@ services:
       VEGAS_OUTPUT_FILE: /app/data/vegas_odds_snapshot.json
       VEGAS_SNAPSHOT_FILE: /app/data/vegas_odds_snapshot.json
       SHARPX_WATCHLIST_FILE: /app/data/sharpx_watchlist.json
-    command: ["node", "--title=oddsaggregator-headless-primary", "src/vegas_odds_monitor.js"]
+      MONITOR_HEARTBEAT_FILE: /app/data/vegas_odds_snapshot.json
+      MONITOR_STALE_MS: "${MONITOR_STALE_MS:-120000}"
+      MONITOR_STARTUP_GRACE_MS: "${MONITOR_STARTUP_GRACE_MS:-180000}"
+      MONITOR_POLL_MS: "${MONITOR_POLL_MS:-10000}"
+    command: ["node", "/usr/local/bin/monitor-supervisor.mjs", "src/vegas_odds_monitor.js"]
+    healthcheck:
+      test: ["CMD", "node", "/usr/local/bin/monitor-healthcheck.mjs", "/app/data/vegas_odds_snapshot.json"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
 
 volumes:
   chrome-profile:
