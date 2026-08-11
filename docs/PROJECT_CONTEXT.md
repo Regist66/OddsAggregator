@@ -15,12 +15,13 @@ futás közben látható Docker-konténerlimit körülbelül 3,825 GiB volt. A h
 Chrome-os production monitorok és a `pia-gluetun` a legutóbbi kétórás tesztben
 végig `running/healthy` állapotban maradtak, újraindítás és OOM nélkül.
 
-A közvetlen stack jelenlegi compose-fájlja az
-`infra/docker/compose.direct.yml`. Ez már mindhárom direct collectort és a
-direct aggregátort tartalmazza, de még shadow/test jellegű kimenetet ír a
-`runtime/direct-primary/` könyvtárba. Production writerként csak külön
-hardening után használható; a kanonikus `data/` kimeneteket egyszerre csak egy
-aktív stack írhatja.
+A direct teszt stack compose-fájlja az `infra/docker/compose.direct.yml`, és
+elkülönített `runtime/direct-primary/` kimenetre ír. Az első direct production
+canary profile elkészült az `infra/docker/compose.direct-production.yml`,
+amely folyamatosan fut és a passzív `runtime/direct-production/` könyvtárba ír.
+Restart, supervisor, tartalmi healthcheck, log-retention és run-manifest már
+van benne; a kanonikus `data/` kimeneteket továbbra sem írja, és egyszerre csak
+egy aktív stack írhatja őket.
 
 Dockerben a host oldali kanonikus volume-ok tényleges helye jelenleg
 `runtime/data/`; a dokumentum régebbi Windows-szakaszai rövidségből gyakran
@@ -545,12 +546,16 @@ validáció; a régi 7 órás eredmény ezért nem használható release-elfogad
 
 ## Következő lépések – fokozatos direct production átállás
 
-1. Külön direct-production Compose/profile létrehozása a jelenlegi shadow
-   compose alapján. A véges smoke duration, a tesztkimenet és a
-   `ALLOW_PARALLEL_DIRECT=1` nem kerülhet át változtatás nélkül productionbe.
-2. Production hardening: `restart: unless-stopped`, heartbeat- és output-
-   freshness healthcheck, watchdog/supervisor, konténerenkénti logolás,
-   egységes `Status`/`Stop`, valamint közös run-manifest vagy állapotfájl.
+1. **Elkészült:** külön direct-production Compose/profile a jelenlegi shadow
+   compose alapján: `infra/docker/compose.direct-production.yml`, valamint a
+   `start-direct-production.sh`, `status-direct-production.sh` és
+   `stop-direct-production.sh` lifecycle. A profile folyamatosan fut, passzív
+   kimenetre ír, és nem használ smoke durationt vagy
+   `ALLOW_PARALLEL_DIRECT=1` kapcsolót.
+2. **Elkészült:** production hardening: `restart: unless-stopped`, heartbeat-
+   és tartalmi output-freshness healthcheck, watchdog/supervisor,
+   konténerenkénti log-retention, egységes `Status`/`Stop`, valamint közös
+   `runtime/direct-production/run-manifest.json` állapotfájl.
 3. Active/passive kimeneti könyvtár és atomikus snapshot-promóció kialakítása.
    Incomplete vagy stale direct snapshot nem írhatja felül az utolsó
    last-known-good kanonikus kimenetet; legyen automatikus rollback headlessre.
@@ -763,22 +768,28 @@ SharpX `snapshot-skew-high` rate before spending eight hours on a soak run.
 
 A kétórás futás alapján az infrastruktúra és a direct adatút működőképes, ezért
 a direct production irány indokolt. Nem indokolt azonban mindhárom monitort
-egyszerre átkapcsolni, és a jelenlegi `compose.direct.yml` még nem tekinthető
-production compose-nak.
+egyszerre átkapcsolni. Az első, passzív canary profile már elkészült, de a
+`compose.direct-production.yml` még nem tekinthető teljes production
+hardeningnek.
 
 Az első éles canary legyen Vegas direct, 24 órás passzív összevetéssel és
 headless fallbackkel. A sikeres Vegas canary után TippmixPro, végül SharpX
 következzen. A Chrome csak akkor vezethető ki, ha mindhárom direct provider
 külön canaryja sikeres és az összes kanonikus output ownership egyértelmű.
 
+### Elkészült hardening
+
+- A `infra/docker/compose.direct-production.yml` minden direct collectorra és
+  az aggregátorra explicit `restart: unless-stopped` policyt, supervisor-
+  watchdogot és tartalmi output freshness healthchecket állít.
+- A lifecycle scriptek a `runtime/direct-production/run-manifest.json` közös
+  állapotfájlt atomikusan frissítik `starting`, `running`, `stopping`, `stopped`
+  és hibás átmeneti állapotokkal.
+- A Compose szolgáltatások korlátozott `json-file` log-retentiont használnak,
+  így egy hosszú canary nem növeli korlátlanul a Docker logokat.
+
 ### Kötelező implementációs elemek a következő sessionben
 
-- A `infra/docker/compose.direct.yml`-ből külön, végtelen futásra szánt
-  direct-production konfiguráció/profil készüljön. A `DIRECT_DURATION_HOURS=0`
-  lehet a folyamatos futás jelzése, de a health/restart/rollback viselkedést
-  explicit módon kell megadni.
-- A direct collectorok és az aggregátor kapjanak `restart: unless-stopped`
-  policyt, saját heartbeat/output freshness healthchecket és watchdogot.
 - A collector ne közvetlenül a kanonikus `data\` fájlokat írja. Először teljes
   staging snapshot készüljön, majd ellenőrzött, atomikus promócióval váljon
   aktívvá. Promóciós hiba vagy freshness/coverage-gate hiba esetén maradjon az

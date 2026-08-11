@@ -170,6 +170,32 @@ fail-closed állapotot. A headless production stack változatlanul a
 `infra/docker/compose.yml` fájllal kezelhető, ezért a direct smoke nem írja felül
 annak kanonikus kimeneteit.
 
+## WSL direct production canary profile
+
+Az első direct production lépéshez külön, folyamatosan futó és passzív canary
+profile készült. A profile nem használ duration-paramétert és nem igényli az
+`ALLOW_PARALLEL_DIRECT=1` kapcsolót, ezért a headless production stack mellett
+is elindítható. A collectorkimenetek és a direct aggregátor eredményei a
+`runtime/direct-production/` könyvtárba kerülnek; a kanonikus
+`runtime/data/` fájlokat nem írják.
+
+Indítás, állapotellenőrzés és leállítás:
+
+```bash
+./infra/docker/start-direct-production.sh
+./infra/docker/status-direct-production.sh
+docker compose -f infra/docker/compose.direct-production.yml logs -f --tail=100
+./infra/docker/stop-direct-production.sh
+```
+
+Ez jelenleg passzív összevetési profile, de már tartalmazza a
+`restart: unless-stopped` policyt, a collector- és aggregator-watchdogot,
+tartalmi output freshness healthcheckeket, korlátozott Docker log-retentiont
+és az atomikusan frissített `runtime/direct-production/run-manifest.json`
+állapotfájlt. A kanonikus output promóciója és az automatikus rollback még a
+következő migrációs lépés része. A profile a `pia-gluetun` meglétét, futását és
+health állapotát, valamint a headless image meglétét induláskor ellenőrzi.
+
 ### Stabilitási és izolációs szabályok
 
 A production headless monitorok output-frissesség alapú supervisor alatt futnak.
