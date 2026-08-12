@@ -92,6 +92,31 @@ const CONFIG = {
     min: 1_000,
     max: 120_000,
   }),
+  websocketHandshakeTimeoutMs: envNumber(
+    "SHARPX_WEBSOCKET_HANDSHAKE_TIMEOUT_MS",
+    10_000,
+    { integer: true, min: 1_000, max: 120_000 },
+  ),
+  websocketFrameTimeoutMs: envNumber(
+    "SHARPX_WEBSOCKET_FRAME_TIMEOUT_MS",
+    30_000,
+    { integer: true, min: 1_000, max: 300_000 },
+  ),
+  websocketReconnectBaseMs: envNumber(
+    "SHARPX_WEBSOCKET_RECONNECT_BASE_MS",
+    1_000,
+    { integer: true, min: 100, max: 60_000 },
+  ),
+  websocketReconnectMaxMs: envNumber(
+    "SHARPX_WEBSOCKET_RECONNECT_MAX_MS",
+    10_000,
+    { integer: true, min: 100, max: 120_000 },
+  ),
+  allSocketRecoveryMs: envNumber("SHARPX_ALL_SOCKET_RECOVERY_MS", 30_000, {
+    integer: true,
+    min: 1_000,
+    max: 300_000,
+  }),
   once: process.env.SHARPX_ONCE === "1",
 };
 
@@ -275,13 +300,18 @@ async function findSharpXTarget() {
   return target;
 }
 
-export function browserCollectorSource() {
+export function browserCollectorSource(overrides = {}) {
   const options = JSON.stringify({
     prematchMinimumMatched: CONFIG.prematchMinimumMatched,
     marketsPerSocket: CONFIG.marketsPerSocket,
     livePriceMaxAgeMs: CONFIG.livePriceMaxAgeMs,
     fetchTimeoutMs: CONFIG.fetchTimeoutMs,
     subscriptionFallbackMaxAgeMs: CONFIG.subscriptionFallbackMaxAgeMs,
+    websocketHandshakeTimeoutMs: CONFIG.websocketHandshakeTimeoutMs,
+    websocketFrameTimeoutMs: CONFIG.websocketFrameTimeoutMs,
+    websocketReconnectBaseMs: CONFIG.websocketReconnectBaseMs,
+    websocketReconnectMaxMs: CONFIG.websocketReconnectMaxMs,
+    ...overrides,
   });
 
   return `(() => {
@@ -313,10 +343,12 @@ export function browserCollectorSource() {
       catalogue: new Map(),
       prices: new Map(),
       connections: [],
+      pendingReconnects: new Set(),
       generation: 0,
       subscriptionSignature: "",
       lastCatalogueRefreshAt: null,
       lastError: null,
+      allConnectionsUnhealthySince: null,
 
       async refreshCatalogue() {
         const requestBody = {
@@ -431,24 +463,63 @@ export function browserCollectorSource() {
           sessionId +
           "/websocket";
         const connection = {
-          socket: new WebSocket(url),
+          socket: null,
           markets,
           generation,
           attempt,
+          id: generation + "-" + serverId + "-" + sessionId,
           readyMarkets: new Set(),
           intentionallyClosed: false,
+          reconnectScheduled: false,
+          reconnectTimer: null,
+          handshakeTimer: null,
+          frameTimer: null,
           opened: false,
+          createdAt: Date.now(),
           lastFrameAt: null,
+          restartReason: null,
         };
+        const armFrameWatchdog = () => {
+          clearTimeout(connection.frameTimer);
+          if (connection.intentionallyClosed || generation !== this.generation) return;
+          connection.frameTimer = setTimeout(() => {
+            if (connection.intentionallyClosed || generation !== this.generation) return;
+            const lastFrameAt = Number(connection.lastFrameAt ?? 0);
+            const ageMs = lastFrameAt > 0 ? Date.now() - lastFrameAt : Number.POSITIVE_INFINITY;
+            if (!connection.opened || ageMs >= options.websocketFrameTimeoutMs) {
+              this.restartConnection(connection, connection.opened ? "frame-timeout" : "handshake-timeout");
+              return;
+            }
+            armFrameWatchdog();
+          }, options.websocketFrameTimeoutMs);
+        };
+
+        try {
+          connection.socket = new WebSocket(url);
+        } catch (error) {
+          connection.restartReason = "constructor-error: " + String(error?.message ?? error);
+          this.connections.push(connection);
+          this.scheduleReconnect(connection);
+          return;
+        }
         this.connections.push(connection);
+        connection.handshakeTimer = setTimeout(() => {
+          if (!connection.opened && !connection.intentionallyClosed) {
+            this.restartConnection(connection, "handshake-timeout");
+          }
+        }, options.websocketHandshakeTimeoutMs);
+        armFrameWatchdog();
 
         connection.socket.onmessage = event => {
           if (generation !== this.generation) return;
           const raw = String(event.data);
           connection.lastFrameAt = Date.now();
+          armFrameWatchdog();
 
           if (raw === "o") {
             connection.opened = true;
+            clearTimeout(connection.handshakeTimer);
+            connection.handshakeTimer = null;
             connection.socket.send(
               JSON.stringify([
                 JSON.stringify(
@@ -510,17 +581,64 @@ export function browserCollectorSource() {
         };
 
         connection.socket.onerror = () => {
-          this.lastError = "SharpX WebSocket hiba";
+          this.lastError = "SharpX WebSocket hiba (" +
+            (connection.restartReason ?? "socket-error") + ")";
         };
 
         connection.socket.onclose = () => {
           connection.opened = false;
+          clearTimeout(connection.handshakeTimer);
+          clearTimeout(connection.frameTimer);
+          connection.handshakeTimer = null;
+          connection.frameTimer = null;
           connection.readyMarkets.clear();
           this.connections = this.connections.filter(item => item !== connection);
           if (connection.intentionallyClosed || generation !== this.generation) return;
-          const delay = Math.min(10_000, 500 * 2 ** Math.min(attempt, 5));
-          setTimeout(() => this.openConnection(markets, generation, attempt + 1), delay);
+          this.scheduleReconnect(connection);
         };
+      },
+
+      scheduleReconnect(connection) {
+        if (
+          connection.reconnectScheduled ||
+          connection.intentionallyClosed ||
+          connection.generation !== this.generation
+        ) return;
+        connection.reconnectScheduled = true;
+        this.pendingReconnects.add(connection);
+        const delay = Math.min(
+          options.websocketReconnectMaxMs,
+          options.websocketReconnectBaseMs * 2 ** Math.min(connection.attempt, 5),
+        );
+        connection.reconnectTimer = setTimeout(() => {
+          connection.reconnectTimer = null;
+          this.pendingReconnects.delete(connection);
+          if (connection.intentionallyClosed || connection.generation !== this.generation) return;
+          this.openConnection(connection.markets, connection.generation, connection.attempt + 1);
+        }, delay);
+      },
+
+      restartConnection(connection, reason) {
+        if (
+          connection.intentionallyClosed ||
+          connection.reconnectScheduled ||
+          connection.generation !== this.generation
+        ) return;
+        connection.restartReason = reason;
+        this.lastError = "SharpX WebSocket újraindítás: " + reason;
+        clearTimeout(connection.handshakeTimer);
+        clearTimeout(connection.frameTimer);
+        connection.handshakeTimer = null;
+        connection.frameTimer = null;
+        connection.intentionallyClosed = true;
+        this.connections = this.connections.filter(item => item !== connection);
+        try {
+          connection.socket?.close();
+        } catch {
+          // A socket a timeouttal párhuzamosan bezáródhatott.
+        }
+        connection.intentionallyClosed = false;
+        this.scheduleReconnect(connection);
       },
 
       getSnapshot() {
@@ -581,18 +699,47 @@ export function browserCollectorSource() {
           )
           .sort((left, right) => right.totalMatched - left.totalMatched);
 
+        const currentConnections = this.connections.filter(
+          connection => connection.generation === this.generation,
+        );
+        const expectedConnections = currentConnections.length + this.pendingReconnects.size;
+        const freshFrameConnections = currentConnections.filter(connection =>
+          connection.opened &&
+          Number.isFinite(Number(connection.lastFrameAt)) &&
+          now - Number(connection.lastFrameAt) <= options.websocketFrameTimeoutMs,
+        );
+        const allConnectionsUnhealthy =
+          selectedIds.size > 0 &&
+          expectedConnections > 0 &&
+          freshFrameConnections.length === 0;
+        if (allConnectionsUnhealthy) {
+          this.allConnectionsUnhealthySince ??= now;
+        } else {
+          this.allConnectionsUnhealthySince = null;
+        }
+
         return {
           generatedAt: now,
           generation: this.generation,
           subscribedMarkets: selectedIds.size,
           initializedMarkets: markets.length,
-          connections: this.connections
-            .filter(connection => connection.generation === this.generation)
-            .map(connection => ({
+          connectionHealth: {
+            expectedConnections,
+            activeConnections: currentConnections.length,
+            pendingReconnects: this.pendingReconnects.size,
+            openedConnections: currentConnections.filter(connection => connection.opened).length,
+            freshFrameConnections: freshFrameConnections.length,
+            allConnectionsUnhealthy,
+            allConnectionsUnhealthySince: this.allConnectionsUnhealthySince,
+          },
+          connections: currentConnections.map(connection => ({
+              id: connection.id,
               opened: connection.opened,
               marketCount: connection.markets.length,
               readyCount: connection.readyMarkets.size,
+              createdAt: connection.createdAt,
               lastFrameAt: connection.lastFrameAt,
+              restartReason: connection.restartReason,
             })),
           lastCatalogueRefreshAt: this.lastCatalogueRefreshAt,
           lastError: this.lastError,
@@ -603,9 +750,18 @@ export function browserCollectorSource() {
       closeConnections() {
         for (const connection of this.connections) {
           connection.intentionallyClosed = true;
+          clearTimeout(connection.handshakeTimer);
+          clearTimeout(connection.frameTimer);
+          clearTimeout(connection.reconnectTimer);
           connection.socket.close();
         }
         this.connections = [];
+        for (const connection of this.pendingReconnects) {
+          connection.intentionallyClosed = true;
+          clearTimeout(connection.reconnectTimer);
+        }
+        this.pendingReconnects.clear();
+        this.allConnectionsUnhealthySince = null;
       },
 
       shutdown() {
@@ -1264,6 +1420,10 @@ export function createWatchlist(snapshot) {
   };
 }
 
+export function shouldPreserveSharpXOutputs(snapshot) {
+  return Number(snapshot?.subscribedMarkets) > 0 && Number(snapshot?.initializedMarkets) === 0;
+}
+
 export function createStatusSnapshot(snapshot) {
   return {
     generatedAt: snapshot.generatedAt,
@@ -1272,6 +1432,8 @@ export function createStatusSnapshot(snapshot) {
     initializedMarkets: snapshot.initializedMarkets,
     lastCatalogueRefreshAt: snapshot.lastCatalogueRefreshAt ?? null,
     lastError: snapshot.lastError ?? null,
+    connectionHealth: snapshot.connectionHealth ?? null,
+    connections: snapshot.connections ?? [],
     markets: snapshot.markets.map(market => {
       const teams = market.runners.filter(
         runner =>
@@ -1418,20 +1580,43 @@ async function main() {
     writing = true;
     try {
       const snapshot = await cdp.evaluate(browserGetSnapshotSource, contextId);
+      const preserveOutputs = shouldPreserveSharpXOutputs(snapshot);
+      await writeAtomically(
+        CONFIG.statusSnapshotFile,
+        `${JSON.stringify(createStatusSnapshot(snapshot))}\n`,
+      );
+      if (preserveOutputs) {
+        const unhealthySince = Number(snapshot.connectionHealth?.allConnectionsUnhealthySince ?? 0);
+        const unhealthyForMs = unhealthySince > 0 ? Date.now() - unhealthySince : 0;
+        console.warn(
+          `[output] ${snapshot.initializedMarkets}/${snapshot.subscribedMarkets} SharpX; ` +
+          `utolsó jó kimenet megtartva` +
+          (snapshot.connectionHealth?.allConnectionsUnhealthy &&
+          unhealthyForMs >= CONFIG.allSocketRecoveryMs
+            ? `; minden WebSocket unhealthy ${Math.round(unhealthyForMs / 1000)}s, collector recovery`
+            : ""),
+        );
+        if (
+          snapshot.connectionHealth?.allConnectionsUnhealthy &&
+          unhealthyForMs >= CONFIG.allSocketRecoveryMs
+        ) {
+          try {
+            await recoverCollector();
+          } catch (recoveryError) {
+            console.error(`[recovery] ${recoveryError.message}`);
+            await stop(1);
+          }
+        }
+        return;
+      }
       // Publish the small, freshness-critical reference snapshots before the
       // expensive bookmaker matching and surebet rendering. Their generatedAt
       // timestamp now reflects the time the browser snapshot was read, not the
       // end of a potentially multi-second render cycle.
-      await Promise.all([
-        writeAtomically(
-          CONFIG.watchlistFile,
-          `${JSON.stringify(createWatchlist(snapshot), null, 2)}\n`,
-        ),
-        writeAtomically(
-          CONFIG.statusSnapshotFile,
-          `${JSON.stringify(createStatusSnapshot(snapshot))}\n`,
-        ),
-      ]);
+      await writeAtomically(
+        CONFIG.watchlistFile,
+        `${JSON.stringify(createWatchlist(snapshot), null, 2)}\n`,
+      );
       await refreshTeamAliases();
       const now = Date.now();
       const liveMarkets = snapshot.markets.filter(market => market.inPlay === true);

@@ -204,6 +204,13 @@ kilép, a Compose pedig az `unless-stopped` szabály szerint újraindítja a
 monitor konténert. A `docker compose ps` ezért a monitorok health állapotát is
 mutatja.
 
+SharpX-nél a websocketek 10 másodperces handshake-, illetve 30 másodperces
+frame-timeout után kontrolláltan újracsatlakoznak. Ha minden socket egyszerre
+egészségtelen, 30 másodperc után a collector újrainicializálódik. Amíg a
+SharpX-hoz feliratkozott piacok száma nem nulla, de egyetlen piac sem
+inicializált, a monitor nem írja felül az utolsó jó `combined_odds.txt` és
+`surebets_live_odds.txt` kimenetet.
+
 A direct smoke indító alapértelmezetten megtagadja a futó production stack
 melletti indulást, mert mindkettő a `pia-gluetun` network namespace-ét használná.
 Tudatos, párhuzamos futtatás csak explicit engedéllyel indítható:
@@ -493,6 +500,11 @@ A leggyakrabban használt felülírások:
 | `SHARPX_PREMATCH_MIN_MATCHED` | `300` EUR |
 | `SHARPX_OUTPUT_INTERVAL_MS` | `1000` |
 | `SHARPX_PREMATCH_RENDER_MS` | `5000` |
+| `SHARPX_WEBSOCKET_HANDSHAKE_TIMEOUT_MS` | `10000` |
+| `SHARPX_WEBSOCKET_FRAME_TIMEOUT_MS` | `30000` |
+| `SHARPX_WEBSOCKET_RECONNECT_BASE_MS` | `1000` |
+| `SHARPX_WEBSOCKET_RECONNECT_MAX_MS` | `10000` |
+| `SHARPX_ALL_SOCKET_RECOVERY_MS` | `30000` |
 | `TIPPMIXPRO_OUTPUT_INTERVAL_MS` | `1000` |
 | `VEGAS_OUTPUT_INTERVAL_MS` | `1000` |
 | `VEGAS_LIVE_REFRESH_MS` | `1000` |

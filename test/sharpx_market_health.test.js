@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { browserCollectorSource, sameEventPhase } from "../src/sharpx_odds_monitor.js";
+import {
+  browserCollectorSource,
+  sameEventPhase,
+  shouldPreserveSharpXOutputs,
+} from "../src/sharpx_odds_monitor.js";
 import { isRenderableMarket, mergeSharpXPrice } from "../src/sharpx_market_renderability.js";
 import { catalogueRetryOptions } from "../src/sharpx_direct_shadow.js";
 
@@ -18,6 +22,67 @@ test("SharpX uses a bounded retry profile during startup", () => {
     retryBaseMs: 1_000,
     retryMaxMs: 15_000,
   });
+});
+
+test("SharpX preserves the last output while the subscribed snapshot is empty", () => {
+  assert.equal(shouldPreserveSharpXOutputs({ subscribedMarkets: 10, initializedMarkets: 0 }), true);
+  assert.equal(shouldPreserveSharpXOutputs({ subscribedMarkets: 10, initializedMarkets: 1 }), false);
+  assert.equal(shouldPreserveSharpXOutputs({ subscribedMarkets: 0, initializedMarkets: 0 }), false);
+});
+
+test("SharpX reconnects a socket stuck before the protocol handshake", async () => {
+  const previousWebSocket = globalThis.WebSocket;
+  class StuckWebSocket {
+    static OPEN = 1;
+    static CONNECTING = 0;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    static instances = [];
+
+    constructor() {
+      this.readyState = StuckWebSocket.CONNECTING;
+      StuckWebSocket.instances.push(this);
+    }
+
+    send() {}
+
+    close() {
+      if (this.readyState === StuckWebSocket.CLOSED) return;
+      this.readyState = StuckWebSocket.CLOSED;
+      this.onclose?.();
+    }
+  }
+
+  globalThis.WebSocket = StuckWebSocket;
+  new Function(`return ${browserCollectorSource({
+    websocketHandshakeTimeoutMs: 10,
+    websocketFrameTimeoutMs: 20,
+    websocketReconnectBaseMs: 1,
+    websocketReconnectMaxMs: 2,
+  })};`)();
+  const collector = globalThis.__sharpXMatchOddsCollector;
+  try {
+    const market = {
+      marketId: "1.123",
+      eventId: "event-1",
+      eventName: "Home v Away",
+      competitionName: "League",
+      marketStartTime: Date.now() + 60_000,
+      inPlay: false,
+      totalMatched: 100,
+      runners: [],
+    };
+    collector.catalogue.set(market.marketId, market);
+    collector.applySubscriptions([market]);
+    await new Promise(resolve => setTimeout(resolve, 35));
+    assert.ok(StuckWebSocket.instances.length >= 2);
+    assert.equal(collector.getSnapshot().connectionHealth.allConnectionsUnhealthy, true);
+  } finally {
+    collector.shutdown();
+    delete globalThis.__sharpXMatchOddsCollector;
+    if (previousWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = previousWebSocket;
+  }
 });
 
 function seededCollector({ status = "OPEN", inPlay = true, oddsAgeMs = 0, rc } = {}) {

@@ -648,6 +648,11 @@ A forráskód CDP-alapértéke `9222`; a `headless_primary.ps1` induláskor mind
 | `SHARPX_MARKETS_PER_SOCKET` | `30` |
 | `SHARPX_LIVE_PRICE_MAX_AGE_MS` | `10000` |
 | `SHARPX_FETCH_TIMEOUT_MS` | `15000` |
+| `SHARPX_WEBSOCKET_HANDSHAKE_TIMEOUT_MS` | `10000` |
+| `SHARPX_WEBSOCKET_FRAME_TIMEOUT_MS` | `30000` |
+| `SHARPX_WEBSOCKET_RECONNECT_BASE_MS` | `1000` |
+| `SHARPX_WEBSOCKET_RECONNECT_MAX_MS` | `10000` |
+| `SHARPX_ALL_SOCKET_RECOVERY_MS` | `30000` |
 | `BOOKMAKER_SNAPSHOT_MAX_AGE_MS` | `10000` |
 | `SNAPSHOT_FUTURE_TOLERANCE_MS` | `5000` |
 | `TIPPMIXPRO_SOURCE_MAX_AGE_MS` | `30000` |
@@ -787,6 +792,10 @@ külön canaryja sikeres és az összes kanonikus output ownership egyértelmű.
   és hibás átmeneti állapotokkal.
 - A Compose szolgáltatások korlátozott `json-file` log-retentiont használnak,
   így egy hosszú canary nem növeli korlátlanul a Docker logokat.
+- A headless SharpX websocketek handshake- és frame-watchdogot használnak;
+  timeout esetén kontrollált reconnect indul. Ha minden socket egyszerre
+  egészségtelen, a monitor collector-recoveryt indít. Üres, `0/N` SharpX
+  snapshot nem írja felül az utolsó jó odds- és surebet-kimenetet.
 
 ### Kötelező implementációs elemek a következő sessionben
 
