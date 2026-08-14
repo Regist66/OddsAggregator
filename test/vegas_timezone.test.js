@@ -82,3 +82,72 @@ test("Vegas live refresh uses the freshness-safe timeout", async () => {
     delete globalThis.__vegasSoccerCollector;
   }
 });
+
+test("Vegas live refresh retries a transient request failure", async () => {
+  new Function(`return ${browserCollectorSource()};`)();
+  const collector = globalThis.__vegasSoccerCollector;
+  try {
+    let attempts = 0;
+    collector.request = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("transient live failure");
+      return { events: [], markets: [], odds: [], competitors: [], champs: [] };
+    };
+
+    await collector.refreshLive();
+
+    assert.equal(attempts, 2);
+    assert.equal(collector.liveRefresh.retries, 1);
+    assert.equal(collector.liveRefresh.successes, 1);
+    assert.equal(collector.liveRefresh.failures, 0);
+    assert.ok(Number.isFinite(collector.lastLiveRefreshAt));
+  } finally {
+    collector.shutdown();
+    delete globalThis.__vegasSoccerCollector;
+  }
+});
+
+test("Vegas live refresh records bounded timeout failures and backoff", async () => {
+  new Function(`return ${browserCollectorSource()};`)();
+  const collector = globalThis.__vegasSoccerCollector;
+  try {
+    collector.request = async () => {
+      throw new Error("GetLiveOverview kérés időtúllépés");
+    };
+
+    const result = await collector.refreshLive();
+
+    assert.equal(result.ok, false);
+    assert.equal(collector.liveRefresh.failures, 1);
+    assert.equal(collector.liveRefresh.timeouts, 1);
+    assert.equal(collector.liveRefresh.retries, 1);
+    assert.equal(collector.liveRefresh.consecutiveFailures, 1);
+    assert.equal(collector.liveRefresh.backoffMs, 500);
+    assert.ok(Number.isFinite(collector.liveRefresh.nextAttemptAt));
+  } finally {
+    collector.shutdown();
+    delete globalThis.__vegasSoccerCollector;
+  }
+});
+
+test("Vegas targeted refresh keeps successful batches when another batch fails", async () => {
+  new Function(`return ${browserCollectorSource()};`)();
+  const collector = globalThis.__vegasSoccerCollector;
+  try {
+    const eventIds = Array.from({ length: 51 }, (_, index) => index + 1);
+    collector.availableEventIds = new Set(eventIds);
+    collector.request = async (endpoint, suffix) => {
+      assert.equal(endpoint, "GetEventsById");
+      if (suffix.includes("eventIds=51")) throw new Error("transient detail failure");
+      return { events: [], markets: [], odds: [], competitors: [], champs: [] };
+    };
+
+    const result = await collector.refreshEvents(eventIds);
+
+    assert.equal(result.failedBatches, 1);
+    assert.equal(result.refreshedEvents, 0);
+  } finally {
+    collector.shutdown();
+    delete globalThis.__vegasSoccerCollector;
+  }
+});

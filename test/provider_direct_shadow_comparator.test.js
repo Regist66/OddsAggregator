@@ -194,6 +194,34 @@ test("warmup and invalid samples cannot change coverage maxima or content totals
   assert.deepEqual(summary.invalidSamplesByReason, { "direct-content-stale": 1 });
 });
 
+test("invalid samples are grouped into measurable freshness episodes", () => {
+  const stats = createStats();
+  recordSample(stats, {
+    warmup: false,
+    sampleValid: false,
+    invalidReasons: ["direct-last-live-refresh-at-stale"],
+    at: 1_000,
+  });
+  recordSample(stats, {
+    warmup: false,
+    sampleValid: false,
+    invalidReasons: ["direct-last-live-refresh-at-stale"],
+    at: 2_000,
+  });
+  recordSample(stats, {
+    warmup: false,
+    sampleValid: true,
+    comparison: compareSnapshots(vegasSnapshot(), vegasSnapshot(), "vegas"),
+    at: 3_500,
+  });
+
+  const summary = summarizedStats(stats);
+  assert.equal(summary.invalidEpisodeCount, 1);
+  assert.equal(summary.invalidEpisodeTotalMs, 2_500);
+  assert.equal(summary.invalidEpisodeMaxMs, 2_500);
+  assert.equal(summary.activeInvalidMs, 0);
+});
+
 test("main writes a provider-aware summary from local fixtures", async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "provider-comparator-test-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));

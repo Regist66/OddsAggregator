@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  assessSharpXCoverage,
   browserCollectorSource,
+  createStatusSnapshot,
   sameEventPhase,
   shouldPreserveSharpXOutputs,
 } from "../src/sharpx_odds_monitor.js";
@@ -24,10 +26,47 @@ test("SharpX uses a bounded retry profile during startup", () => {
   });
 });
 
-test("SharpX preserves the last output while the subscribed snapshot is empty", () => {
+test("SharpX applies the configured coverage gate before publishing output", () => {
+  assert.deepEqual(assessSharpXCoverage({ subscribedMarkets: 10, initializedMarkets: 9 }), {
+    healthy: true,
+    reasons: [],
+    subscribedMarkets: 10,
+    initializedMarkets: 9,
+    coverageRatio: 0.9,
+    minimumCoverageRatio: 0.9,
+  });
   assert.equal(shouldPreserveSharpXOutputs({ subscribedMarkets: 10, initializedMarkets: 0 }), true);
-  assert.equal(shouldPreserveSharpXOutputs({ subscribedMarkets: 10, initializedMarkets: 1 }), false);
+  assert.equal(shouldPreserveSharpXOutputs({ subscribedMarkets: 10, initializedMarkets: 8 }), true);
+  assert.equal(shouldPreserveSharpXOutputs({ subscribedMarkets: 10, initializedMarkets: 9 }), false);
   assert.equal(shouldPreserveSharpXOutputs({ subscribedMarkets: 0, initializedMarkets: 0 }), false);
+});
+
+test("SharpX status snapshot exposes output health and coverage", () => {
+  const snapshot = createStatusSnapshot({
+    generatedAt: 100,
+    generation: 2,
+    subscribedMarkets: 10,
+    initializedMarkets: 8,
+    lastCatalogueRefreshAt: 90,
+    lastError: null,
+    markets: [],
+  }, {
+    outputHealth: {
+      state: "degraded",
+      reason: "coverage-low",
+      coverageRatio: 0.8,
+      lastGoodOutputAvailable: true,
+    },
+    diagnostics: {
+      cdp: { commandTimeouts: 2 },
+      recovery: { runs: 1 },
+    },
+  });
+  assert.equal(snapshot.outputHealth.state, "degraded");
+  assert.equal(snapshot.outputHealth.coverageRatio, 0.8);
+  assert.equal(snapshot.outputHealth.lastGoodOutputAvailable, true);
+  assert.equal(snapshot.diagnostics.cdp.commandTimeouts, 2);
+  assert.equal(snapshot.diagnostics.recovery.runs, 1);
 });
 
 test("SharpX reconnects a socket stuck before the protocol handshake", async () => {

@@ -211,6 +211,12 @@ SharpX-hoz feliratkozott piacok száma nem nulla, de egyetlen piac sem
 inicializált, a monitor nem írja felül az utolsó jó `combined_odds.txt` és
 `surebets_live_odds.txt` kimenetet.
 
+A SharpX output csak akkor kerül publikálásra, ha az inicializált/feliratkozott
+piacok aránya legalább 90%. Coverage-hiba esetén az utolsó jó output legfeljebb
+5 percig marad érvényes; utána fail-closed `UNAVAILABLE` kimenet készül. A
+status snapshot `outputHealth` mezője és a Docker healthcheck ezt a tartalmi
+állapotot is ellenőrzi.
+
 A direct smoke indító alapértelmezetten megtagadja a futó production stack
 melletti indulást, mert mindkettő a `pia-gluetun` network namespace-ét használná.
 Tudatos, párhuzamos futtatás csak explicit engedéllyel indítható:
@@ -281,7 +287,10 @@ oddsokkal, azok `oddsUpdatedAt` forrásidejével és a státuszsnapshot
 `statusSnapshotGeneratedAt` idejével.
 A SharpX állapotokat a `data\sharpx_status_snapshot.json` tartalmazza. A részletes
 `health.jsonl` és `events.jsonl` csak diagnosztikához szükséges, nem az éles
-kimeneteket módosítja.
+kimeneteket módosítja. A `summary.json` `completionStatus` mezője jelzi a
+szabályos lezárást; a `snapshotFreshness`, `sharpXCoverage` és
+`monitorDiagnostics` blokkokban a fájlkorok, coverage-minimumok, CDP timeoutok,
+recovery/initialization és output hibák kumulatív számlálói találhatók.
 
 Élő összevetéshez minden shadow run a saját
 `data\shadow-headless\<id>\football\surebets_live_odds.txt` fájlját használja; a
@@ -495,6 +504,7 @@ A leggyakrabban használt felülírások:
 | Változó | Alapérték |
 |---|---|
 | `SHARPX_CDP_ENDPOINT` | `http://127.0.0.1:9222` |
+| `SHARPX_CDP_COMMAND_TIMEOUT_MS` | `60000` |
 | `TIPPMIXPRO_CDP_ENDPOINT` | `http://127.0.0.1:9222` |
 | `VEGAS_CDP_ENDPOINT` | `http://127.0.0.1:9222` |
 | `SHARPX_PREMATCH_MIN_MATCHED` | `300` EUR |
@@ -505,10 +515,21 @@ A leggyakrabban használt felülírások:
 | `SHARPX_WEBSOCKET_RECONNECT_BASE_MS` | `1000` |
 | `SHARPX_WEBSOCKET_RECONNECT_MAX_MS` | `10000` |
 | `SHARPX_ALL_SOCKET_RECOVERY_MS` | `30000` |
+| `SHARPX_OUTPUT_MIN_COVERAGE_RATIO` | `0.90` |
+| `SHARPX_LAST_GOOD_OUTPUT_TTL_MS` | `300000` |
+| `SHARPX_OUTPUT_STATE_FILE` | `data\sharpx_output_state.json` |
 | `TIPPMIXPRO_OUTPUT_INTERVAL_MS` | `1000` |
 | `VEGAS_OUTPUT_INTERVAL_MS` | `1000` |
 | `VEGAS_LIVE_REFRESH_MS` | `1000` |
+| `VEGAS_LIVE_REQUEST_RETRIES` | `1` |
+| `VEGAS_LIVE_RETRY_DELAY_MS` | `150` |
+| `VEGAS_LIVE_REQUEST_BUDGET_MS` | `4500` összesített live request budget |
+| `VEGAS_LIVE_FAILURE_BACKOFF_MS` | `500` |
+| `VEGAS_LIVE_FAILURE_BACKOFF_MAX_MS` | `5000` |
 | `VEGAS_MATCHED_REFRESH_MS` | `5000` |
+| `VEGAS_MATCHED_REQUEST_TIMEOUT_MS` | `8000` |
+| `VEGAS_MATCHED_REQUEST_RETRIES` | `1` |
+| `VEGAS_MATCHED_RETRY_DELAY_MS` | `250` |
 | `SHARPX_OUTPUT_FILE` | `data\combined_odds.txt` a projektben |
 | `SUREBETS_OUTPUT_FILE` | `data\football\surebets_live_odds.txt` a projektben |
 

@@ -31,6 +31,9 @@ const CONFIG = {
   statusSnapshotFile:
     process.env.SHARPX_STATUS_SNAPSHOT_FILE ??
     path.join(DATA_DIR, "sharpx_status_snapshot.json"),
+  outputStateFile:
+    process.env.SHARPX_OUTPUT_STATE_FILE ??
+    path.join(DATA_DIR, "sharpx_output_state.json"),
   teamAliasesFile:
     process.env.TEAM_ALIASES_FILE ?? path.join(CONFIG_DIR, "team_aliases.json"),
   prematchMinimumMatched: envNumber("SHARPX_PREMATCH_MIN_MATCHED", 300, {
@@ -82,11 +85,15 @@ const CONFIG = {
     integer: true,
     min: 1_000,
   }),
-  cdpCommandTimeoutMs: envNumber("CDP_COMMAND_TIMEOUT_MS", 15_000, {
-    integer: true,
-    min: 1_000,
-    max: 120_000,
-  }),
+  cdpCommandTimeoutMs: envNumber(
+    "SHARPX_CDP_COMMAND_TIMEOUT_MS",
+    process.env.CDP_COMMAND_TIMEOUT_MS ?? 60_000,
+    {
+      integer: true,
+      min: 1_000,
+      max: 120_000,
+    },
+  ),
   fetchTimeoutMs: envNumber("SHARPX_FETCH_TIMEOUT_MS", 15_000, {
     integer: true,
     min: 1_000,
@@ -117,6 +124,16 @@ const CONFIG = {
     min: 1_000,
     max: 300_000,
   }),
+  outputMinimumCoverageRatio: envNumber(
+    "SHARPX_OUTPUT_MIN_COVERAGE_RATIO",
+    0.9,
+    { min: 0, max: 1 },
+  ),
+  lastGoodOutputTtlMs: envNumber("SHARPX_LAST_GOOD_OUTPUT_TTL_MS", 300_000, {
+    integer: true,
+    min: 1_000,
+    max: 86_400_000,
+  }),
   once: process.env.SHARPX_ONCE === "1",
 };
 
@@ -126,9 +143,67 @@ const EVENT_TIME_BUCKET_MS = 30 * 60_000;
 const sleep = milliseconds =>
   new Promise(resolve => setTimeout(resolve, milliseconds));
 
+function createMonitorDiagnostics() {
+  return {
+    version: 1,
+    startedAt: Date.now(),
+    cdp: {
+      connectAttempts: 0,
+      connectSuccesses: 0,
+      connectFailures: 0,
+      connectTimeouts: 0,
+      commandTimeouts: 0,
+      commandErrors: 0,
+      unexpectedDisconnects: 0,
+      contextTimeouts: 0,
+    },
+    recovery: {
+      runs: 0,
+      attempts: 0,
+      successes: 0,
+      failures: 0,
+    },
+    catalogue: {
+      refreshes: 0,
+      errors: 0,
+    },
+    output: {
+      cycles: 0,
+      degradedCycles: 0,
+      failedCycles: 0,
+      errors: 0,
+    },
+    lastErrorAt: null,
+    lastError: null,
+    lastEvent: null,
+  };
+}
+
+function incrementDiagnostic(diagnostics, section, field, details = {}) {
+  diagnostics[section][field] = Number(diagnostics[section][field] ?? 0) + 1;
+  diagnostics.lastEvent = {
+    at: Date.now(),
+    section,
+    field,
+    ...details,
+  };
+}
+
+function recordDiagnosticError(diagnostics, error, details = {}) {
+  diagnostics.lastErrorAt = Date.now();
+  diagnostics.lastError = String(error?.message ?? error);
+  diagnostics.lastEvent = {
+    at: diagnostics.lastErrorAt,
+    type: "error",
+    ...details,
+    message: diagnostics.lastError,
+  };
+}
+
 class CdpClient {
-  constructor(webSocketUrl) {
+  constructor(webSocketUrl, diagnostics) {
     this.webSocketUrl = webSocketUrl;
+    this.diagnostics = diagnostics;
     this.socket = null;
     this.nextId = 0;
     this.pending = new Map();
@@ -142,6 +217,7 @@ class CdpClient {
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(
         () => {
+          incrementDiagnostic(this.diagnostics, "cdp", "connectTimeouts");
           reject(new Error("SharpX CDP kapcsolódási időtúllépés."));
           this.socket?.close();
         },
@@ -172,6 +248,7 @@ class CdpClient {
     const result = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (!this.pending.delete(id)) return;
+        incrementDiagnostic(this.diagnostics, "cdp", "commandTimeouts", { method });
         reject(new Error(`SharpX CDP parancs időtúllépés: ${method}`));
         // A Runtime.evaluate a böngészőben ettől még futhatna tovább. Zárjuk
         // le a hibás CDP-csatornát, hogy a recovery új, tiszta target-kapcsolatot
@@ -182,7 +259,7 @@ class CdpClient {
           // A socket már bezáródhatott a timeouttal párhuzamosan.
         }
       }, CONFIG.cdpCommandTimeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer, method });
     });
 
     this.socket.send(JSON.stringify({ id, method, params }));
@@ -203,6 +280,7 @@ class CdpClient {
       await sleep(100);
     }
 
+    incrementDiagnostic(this.diagnostics, "cdp", "contextTimeouts");
     throw new Error("Nem található a portal.sharpxch.com iframe execution contextje.");
   }
 
@@ -243,7 +321,12 @@ class CdpClient {
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
 
-      if (message.error) pending.reject(new Error(JSON.stringify(message.error)));
+      if (message.error) {
+        incrementDiagnostic(this.diagnostics, "cdp", "commandErrors", {
+          method: pending.method,
+        });
+        pending.reject(new Error(JSON.stringify(message.error)));
+      }
       else pending.resolve(message.result);
       return;
     }
@@ -266,6 +349,8 @@ class CdpClient {
 
   #onClose() {
     if (this.closed) return;
+
+    incrementDiagnostic(this.diagnostics, "cdp", "unexpectedDisconnects");
 
     for (const { reject, timer } of this.pending.values()) {
       clearTimeout(timer);
@@ -1420,11 +1505,50 @@ export function createWatchlist(snapshot) {
   };
 }
 
-export function shouldPreserveSharpXOutputs(snapshot) {
-  return Number(snapshot?.subscribedMarkets) > 0 && Number(snapshot?.initializedMarkets) === 0;
+export function assessSharpXCoverage(
+  snapshot,
+  minimumCoverageRatio = CONFIG.outputMinimumCoverageRatio,
+) {
+  const subscribedMarkets = Number(snapshot?.subscribedMarkets);
+  const initializedMarkets = Number(snapshot?.initializedMarkets);
+  const reasons = [];
+  if (!Number.isInteger(subscribedMarkets) || subscribedMarkets <= 0) {
+    reasons.push("coverage-unavailable");
+  }
+  if (
+    !Number.isInteger(initializedMarkets) ||
+    initializedMarkets < 0 ||
+    (Number.isInteger(subscribedMarkets) && initializedMarkets > subscribedMarkets)
+  ) {
+    reasons.push("coverage-invalid");
+  }
+  const coverageRatio =
+    Number.isInteger(subscribedMarkets) && subscribedMarkets > 0 &&
+    Number.isInteger(initializedMarkets)
+      ? initializedMarkets / subscribedMarkets
+      : null;
+  if (coverageRatio !== null && coverageRatio < minimumCoverageRatio) {
+    reasons.push("coverage-low");
+  }
+  return {
+    healthy: reasons.length === 0,
+    reasons,
+    subscribedMarkets: Number.isInteger(subscribedMarkets) ? subscribedMarkets : null,
+    initializedMarkets: Number.isInteger(initializedMarkets) ? initializedMarkets : null,
+    coverageRatio,
+    minimumCoverageRatio,
+  };
 }
 
-export function createStatusSnapshot(snapshot) {
+export function shouldPreserveSharpXOutputs(
+  snapshot,
+  minimumCoverageRatio = CONFIG.outputMinimumCoverageRatio,
+) {
+  const coverage = assessSharpXCoverage(snapshot, minimumCoverageRatio);
+  return coverage.healthy === false && coverage.subscribedMarkets > 0;
+}
+
+export function createStatusSnapshot(snapshot, monitorState = {}) {
   return {
     generatedAt: snapshot.generatedAt,
     generation: snapshot.generation,
@@ -1434,6 +1558,8 @@ export function createStatusSnapshot(snapshot) {
     lastError: snapshot.lastError ?? null,
     connectionHealth: snapshot.connectionHealth ?? null,
     connections: snapshot.connections ?? [],
+    outputHealth: monitorState.outputHealth ?? null,
+    diagnostics: monitorState.diagnostics ?? null,
     markets: snapshot.markets.map(market => {
       const teams = market.runners.filter(
         runner =>
@@ -1471,6 +1597,63 @@ async function writeAtomically(filename, content) {
   await writeTextAtomically(filename, content);
 }
 
+async function readOutputState(filename, fallbackFiles) {
+  try {
+    const state = JSON.parse(await fs.readFile(filename, "utf8"));
+    return {
+      lastGoodOutputAt: Number.isFinite(Number(state.lastGoodOutputAt))
+        ? Number(state.lastGoodOutputAt)
+        : null,
+      state: state.state ?? "unknown",
+    };
+  } catch {
+    const mtimes = [];
+    for (const fallbackFile of fallbackFiles) {
+      try {
+        mtimes.push((await fs.stat(fallbackFile)).mtimeMs);
+      } catch {
+        return { lastGoodOutputAt: null, state: "unknown" };
+      }
+    }
+    return {
+      lastGoodOutputAt: mtimes.length > 0 ? Math.min(...mtimes) : null,
+      state: "unknown",
+    };
+  }
+}
+
+function unavailableOutput(kind, snapshot, coverage) {
+  return [
+    `*** ${kind} UNAVAILABLE - ${formatTimestamp(snapshot.generatedAt)} ***`,
+    "",
+    `SharpX coverage ${coverage.initializedMarkets ?? 0}/${coverage.subscribedMarkets ?? 0}`,
+    `Reason: ${coverage.reasons.join(", ") || "output-expired"}`,
+    "",
+  ].join("\r\n");
+}
+
+function createOutputHealth(snapshot, coverage, lastGoodOutputAt, now) {
+  const lastGoodOutputAgeMs = lastGoodOutputAt === null
+    ? null
+    : Math.max(0, now - lastGoodOutputAt);
+  const lastGoodOutputAvailable =
+    lastGoodOutputAgeMs !== null && lastGoodOutputAgeMs <= CONFIG.lastGoodOutputTtlMs;
+  return {
+    state: coverage.healthy ? "healthy" : lastGoodOutputAvailable ? "degraded" : "failed",
+    reason: coverage.healthy ? null : coverage.reasons.join(", ") || "coverage-low",
+    generatedAt: now,
+    coverageRatio: coverage.coverageRatio,
+    minimumCoverageRatio: coverage.minimumCoverageRatio,
+    subscribedMarkets: coverage.subscribedMarkets,
+    initializedMarkets: coverage.initializedMarkets,
+    lastGoodOutputAt,
+    lastGoodOutputAgeMs,
+    lastGoodOutputTtlMs: CONFIG.lastGoodOutputTtlMs,
+    lastGoodOutputAvailable,
+    connectionHealth: snapshot.connectionHealth ?? null,
+  };
+}
+
 async function main() {
   await fs.mkdir(path.dirname(CONFIG.surebetsOutputFile), { recursive: true });
   const writerLock = await acquireWriterLocks(
@@ -1479,6 +1662,7 @@ async function main() {
       CONFIG.surebetsOutputFile,
       CONFIG.watchlistFile,
       CONFIG.statusSnapshotFile,
+      CONFIG.outputStateFile,
     ],
     "SharpX production monitor",
   );
@@ -1493,15 +1677,83 @@ async function main() {
   let recoveryPromise = null;
   let refreshingCatalogue = false;
   let prematchCache = null;
+  let lastSnapshot = null;
+  const diagnostics = createMonitorDiagnostics();
+  const outputState = await readOutputState(CONFIG.outputStateFile, [
+    CONFIG.outputFile,
+    CONFIG.surebetsOutputFile,
+  ]);
+  let lastGoodOutputAt = outputState.lastGoodOutputAt;
+  let outputHealth = {
+    state: outputState.state === "healthy" ? "healthy" : "unknown",
+    reason: null,
+    generatedAt: Date.now(),
+    coverageRatio: null,
+    minimumCoverageRatio: CONFIG.outputMinimumCoverageRatio,
+    subscribedMarkets: null,
+    initializedMarkets: null,
+    lastGoodOutputAt,
+    lastGoodOutputAgeMs: null,
+    lastGoodOutputTtlMs: CONFIG.lastGoodOutputTtlMs,
+    lastGoodOutputAvailable: lastGoodOutputAt !== null,
+    connectionHealth: null,
+  };
+
+  const persistOutputState = async (state, now = Date.now()) => {
+    await writeAtomically(
+      CONFIG.outputStateFile,
+      `${JSON.stringify({
+        version: 1,
+        state,
+        updatedAt: now,
+        lastGoodOutputAt,
+      })}\n`,
+    );
+  };
+
+  const writeRecoveryHeartbeat = async () => {
+    if (!lastSnapshot || stopping) return;
+    const now = Date.now();
+    const recoverySnapshot = { ...lastSnapshot, generatedAt: now };
+    const recoveryHealth = {
+      ...outputHealth,
+      state: "degraded",
+      reason: "collector-recovery",
+      generatedAt: now,
+      connectionHealth: recoverySnapshot.connectionHealth ?? null,
+    };
+    try {
+      await writeAtomically(
+        CONFIG.statusSnapshotFile,
+        `${JSON.stringify(createStatusSnapshot(recoverySnapshot, {
+          outputHealth: recoveryHealth,
+          diagnostics,
+        }))}\n`,
+      );
+    } catch (error) {
+      recordDiagnosticError(diagnostics, error, {
+        section: "recovery",
+        field: "heartbeat",
+      });
+    }
+  };
 
   const connectCdp = async (force = false) => {
     if (!force && cdp?.socket?.readyState === WebSocket.OPEN) return;
+    incrementDiagnostic(diagnostics, "cdp", "connectAttempts");
     cdp?.close();
-    const target = await findSharpXTarget();
-    const nextClient = new CdpClient(target.webSocketDebuggerUrl);
-    await nextClient.connect();
-    cdp = nextClient;
-    contextId = undefined;
+    try {
+      const target = await findSharpXTarget();
+      const nextClient = new CdpClient(target.webSocketDebuggerUrl, diagnostics);
+      await nextClient.connect();
+      cdp = nextClient;
+      contextId = undefined;
+      incrementDiagnostic(diagnostics, "cdp", "connectSuccesses");
+    } catch (error) {
+      incrementDiagnostic(diagnostics, "cdp", "connectFailures");
+      recordDiagnosticError(diagnostics, error, { section: "cdp", field: "connectFailures" });
+      throw error;
+    }
   };
 
   const stop = async exitCode => {
@@ -1528,9 +1780,11 @@ async function main() {
 
   const recoverCollector = () => {
     if (recoveryPromise) return recoveryPromise;
+    incrementDiagnostic(diagnostics, "recovery", "runs");
     recoveryPromise = (async () => {
       let lastError;
       for (let attempt = 0; attempt < 20 && !stopping; attempt += 1) {
+        incrementDiagnostic(diagnostics, "recovery", "attempts");
         try {
           if (attempt > 0 || cdp?.socket?.readyState !== WebSocket.OPEN) {
             await connectCdp(attempt > 0);
@@ -1541,12 +1795,16 @@ async function main() {
           console.log(
             `[catalogue] total=${result.catalogueMarkets} selected=${result.selectedMarkets} live=${result.liveMarkets}`,
           );
+          incrementDiagnostic(diagnostics, "recovery", "successes");
           return;
         } catch (error) {
           lastError = error;
-          await sleep(500);
+          recordDiagnosticError(diagnostics, error, { section: "recovery", field: "attempts" });
+          await writeRecoveryHeartbeat();
+          await sleep(Math.min(5_000, 500 * 2 ** Math.min(attempt, 3)));
         }
       }
+      incrementDiagnostic(diagnostics, "recovery", "failures");
       throw lastError ?? new Error("A SharpX collector nem állítható helyre.");
     })().finally(() => {
       recoveryPromise = null;
@@ -1557,12 +1815,15 @@ async function main() {
   const refreshCatalogue = async () => {
     if (recoveryPromise || refreshingCatalogue || writing || stopping) return;
     refreshingCatalogue = true;
+    incrementDiagnostic(diagnostics, "catalogue", "refreshes");
     try {
       const result = await cdp.evaluate(browserRefreshCatalogueSource, contextId);
       console.log(
         `[catalogue] total=${result.catalogueMarkets} selected=${result.selectedMarkets} live=${result.liveMarkets}`,
       );
     } catch (error) {
+      incrementDiagnostic(diagnostics, "catalogue", "errors");
+      recordDiagnosticError(diagnostics, error, { section: "catalogue", field: "errors" });
       console.error(`[catalogue] ${error.message}`);
       try {
         await recoverCollector();
@@ -1576,21 +1837,26 @@ async function main() {
   };
 
   const writeOutput = async () => {
-    if (writing || stopping || recoveryPromise || refreshingCatalogue) return;
+    if (writing || stopping || recoveryPromise) return;
     writing = true;
+    incrementDiagnostic(diagnostics, "output", "cycles");
     try {
       const snapshot = await cdp.evaluate(browserGetSnapshotSource, contextId);
-      const preserveOutputs = shouldPreserveSharpXOutputs(snapshot);
+      lastSnapshot = snapshot;
+      const now = Date.now();
+      const coverage = assessSharpXCoverage(snapshot);
+      outputHealth = createOutputHealth(snapshot, coverage, lastGoodOutputAt, now);
       await writeAtomically(
         CONFIG.statusSnapshotFile,
-        `${JSON.stringify(createStatusSnapshot(snapshot))}\n`,
+        `${JSON.stringify(createStatusSnapshot(snapshot, { outputHealth, diagnostics }))}\n`,
       );
-      if (preserveOutputs) {
+      if (!coverage.healthy) {
+        incrementDiagnostic(diagnostics, "output", "degradedCycles");
         const unhealthySince = Number(snapshot.connectionHealth?.allConnectionsUnhealthySince ?? 0);
-        const unhealthyForMs = unhealthySince > 0 ? Date.now() - unhealthySince : 0;
+        const unhealthyForMs = unhealthySince > 0 ? now - unhealthySince : 0;
         console.warn(
           `[output] ${snapshot.initializedMarkets}/${snapshot.subscribedMarkets} SharpX; ` +
-          `utolsó jó kimenet megtartva` +
+          `${outputHealth.lastGoodOutputAvailable ? "utolsó jó kimenet megtartva" : "nincs érvényes last-good kimenet"}` +
           (snapshot.connectionHealth?.allConnectionsUnhealthy &&
           unhealthyForMs >= CONFIG.allSocketRecoveryMs
             ? `; minden WebSocket unhealthy ${Math.round(unhealthyForMs / 1000)}s, collector recovery`
@@ -1607,6 +1873,22 @@ async function main() {
             await stop(1);
           }
         }
+        if (!outputHealth.lastGoodOutputAvailable) {
+          incrementDiagnostic(diagnostics, "output", "failedCycles");
+          await Promise.all([
+            writeAtomically(
+              CONFIG.outputFile,
+              unavailableOutput("ODDS", snapshot, coverage),
+            ),
+            writeAtomically(
+              CONFIG.surebetsOutputFile,
+              unavailableOutput("SURE BETS", snapshot, coverage),
+            ),
+            persistOutputState("failed", now),
+          ]);
+        } else {
+          await persistOutputState("degraded", now);
+        }
         return;
       }
       // Publish the small, freshness-critical reference snapshots before the
@@ -1618,7 +1900,6 @@ async function main() {
         `${JSON.stringify(createWatchlist(snapshot), null, 2)}\n`,
       );
       await refreshTeamAliases();
-      const now = Date.now();
       const liveMarkets = snapshot.markets.filter(market => market.inPlay === true);
       const liveSignature = liveMarkets
         .map(market => market.marketId)
@@ -1726,6 +2007,13 @@ async function main() {
       };
       await writeAtomically(CONFIG.outputFile, rendered.content);
       await writeAtomically(CONFIG.surebetsOutputFile, surebets.content);
+      lastGoodOutputAt = Date.now();
+      outputHealth = createOutputHealth(snapshot, coverage, lastGoodOutputAt, lastGoodOutputAt);
+      await persistOutputState("healthy", lastGoodOutputAt);
+      await writeAtomically(
+        CONFIG.statusSnapshotFile,
+        `${JSON.stringify(createStatusSnapshot(snapshot, { outputHealth, diagnostics }))}\n`,
+      );
       const status =
         `${snapshot.initializedMarkets}/${snapshot.subscribedMarkets}` +
         ` SharpX, ${rendered.tippmixMatches} TippmixPro, ` +
@@ -1736,6 +2024,8 @@ async function main() {
         console.log(`[output] ${status} markets -> ${CONFIG.outputFile}`);
       }
     } catch (error) {
+      incrementDiagnostic(diagnostics, "output", "errors");
+      recordDiagnosticError(diagnostics, error, { section: "output", field: "errors" });
       console.error(`[output] ${error.message}`);
       if (!error?.isOutputError) {
         try {

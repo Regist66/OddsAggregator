@@ -17,12 +17,16 @@ $runId = "{0}-{1}" -f (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmssfff"
 $shadowDataDir = Join-Path $projectDir "data\shadow-headless\$runId"
 $shadowLogsDir = Join-Path $projectDir "logs\shadow-headless\$runId"
 $comparisonLogsDir = Join-Path $projectDir "logs\shadow-stability\$runId"
+$summaryFile = Join-Path $comparisonLogsDir "summary.json"
 $shadowLiveSurebetsFile = Join-Path $shadowDataDir "football\surebets_live_odds.txt"
 $headlessProfile = Join-Path $env:LOCALAPPDATA "Google\Chrome\OddsAggregatorShadow\$runId"
 $instanceTitle = "oddsaggregator-shadow-headless-$runId"
 $headlessStart = Join-Path $PSScriptRoot "start_headless_ab_test.ps1"
 $comparator = Join-Path $projectDir "src\shadow_stability_comparator.js"
-$normalDataDir = Join-Path $projectDir "data"
+# The Docker production composition persists its live outputs under runtime/data.
+# Keep the shadow comparator pointed at that source so a Docker-backed soak does
+# not silently compare against the legacy host-only data directory.
+$normalDataDir = Join-Path $projectDir "runtime\data"
 $normalLogsDir = Join-Path $projectDir "logs"
 
 function Test-CommandLineFlagValue {
@@ -85,7 +89,38 @@ try {
         Stop-Process -Id $comparatorProcess.Id -Force -ErrorAction SilentlyContinue
         throw "A shadow comparator nem allt le a futasi ido utan 5 percen belul."
     }
-    if ($comparatorProcess.ExitCode -ne 0) { throw "A shadow comparator hibakoddal allt le: $($comparatorProcess.ExitCode)" }
+
+    # WSL/Windows interop alatt a System.Diagnostics.Process ExitCode-ja
+    # idonkent ures marad akkor is, amikor a Node comparator mar szabalyosan
+    # kiirta a teljes summary-t. A summary a meres szemantikai eredmenye;
+    # az exit code csak akkor blokkolja a futast, ha tenylegesen ismert es
+    # nem nulla.
+    $summary = $null
+    try {
+        if (Test-Path -LiteralPath $summaryFile) {
+            $summary = Get-Content -LiteralPath $summaryFile -Raw | ConvertFrom-Json
+        }
+    } catch {
+        throw "A shadow comparator summary.json fajlja nem olvashato: $($_.Exception.Message)"
+    }
+    $expectedDurationSeconds = [double]$effectiveDurationMinutes * 60
+    $minimumCompletedDurationSeconds = [math]::Max(0, $expectedDurationSeconds - 5)
+    $actualDurationSeconds = if ($null -ne $summary) { [double]$summary.durationSeconds } else { 0 }
+    if (
+        $null -eq $summary -or
+        $summary.completionStatus -ne "completed" -or
+        $actualDurationSeconds -lt $minimumCompletedDurationSeconds
+    ) {
+        throw "A shadow comparator summary-ja hianyos vagy korai: $summaryFile"
+    }
+
+    $exitCodeText = [string]$comparatorProcess.ExitCode
+    if ($exitCodeText -match '^-?\d+$') {
+        $exitCode = [int]$exitCodeText
+        if ($exitCode -ne 0) { throw "A shadow comparator hibakoddal allt le: $exitCode" }
+    } else {
+        Write-Warning "A comparator ExitCode-ja nem volt olvashato; a teljes summary alapjan sikeres mereskent folytatom."
+    }
 } finally {
     try {
         if ($null -ne $comparatorProcess) {

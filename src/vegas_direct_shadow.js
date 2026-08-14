@@ -94,6 +94,7 @@ async function main() {
   let selectedIds = [];
   let nextMatchedRefreshAt = 0;
   let matchedRetryMs = 1_000;
+  let matchedRefreshPromise = null;
   let stopping = false;
   const stop = () => {
     stopping = true;
@@ -120,22 +121,35 @@ async function main() {
     }
     while (!stopping && (!CONFIG.durationMs || Date.now() - startedAt < CONFIG.durationMs)) {
       if (Date.now() >= nextMatchedRefreshAt) {
-        try {
-          await refreshTeamAliases();
-          const watchlist = await readWatchlist();
-          const fullSnapshot = collector.snapshot();
-          const index = createEventTimeIndex(fullSnapshot.events);
-          selectedIds = [...new Set((watchlist.events ?? []).map(event =>
-            findVegasEvent(event, timeCandidates(index, event.startTime))?.id,
-          ).filter(Number.isFinite))];
-          if (selectedIds.length) await collector.refreshEvents(selectedIds);
-          nextMatchedRefreshAt = Date.now() + CONFIG.matchedRefreshMs;
-          matchedRetryMs = 1_000;
-        } catch (error) {
-          collector.lastError = error.message;
-          console.error(`[matched-refresh] ${error.message}`);
-          nextMatchedRefreshAt = Date.now() + matchedRetryMs;
-          matchedRetryMs = Math.min(CONFIG.matchedRefreshMs, matchedRetryMs * 2);
+        if (!matchedRefreshPromise) {
+          matchedRefreshPromise = (async () => {
+            try {
+              await refreshTeamAliases();
+              const watchlist = await readWatchlist();
+              const fullSnapshot = collector.snapshot();
+              const index = createEventTimeIndex(fullSnapshot.events);
+              selectedIds = [...new Set((watchlist.events ?? []).map(event =>
+                findVegasEvent(event, timeCandidates(index, event.startTime))?.id,
+              ).filter(Number.isFinite))];
+              const result = selectedIds.length
+                ? await collector.refreshEvents(selectedIds)
+                : { failedBatches: 0 };
+              if (result.failedBatches > 0) {
+                throw new Error(
+                  `GetEventsById: ${result.failedBatches} batch lekérése sikertelen`,
+                );
+              }
+              nextMatchedRefreshAt = Date.now() + CONFIG.matchedRefreshMs;
+              matchedRetryMs = 1_000;
+            } catch (error) {
+              collector.lastError = error.message;
+              console.error(`[matched-refresh] ${error.message}`);
+              nextMatchedRefreshAt = Date.now() + matchedRetryMs;
+              matchedRetryMs = Math.min(CONFIG.matchedRefreshMs, matchedRetryMs * 2);
+            } finally {
+              matchedRefreshPromise = null;
+            }
+          })();
         }
       }
       const snapshot = collector.snapshot(selectedIds);

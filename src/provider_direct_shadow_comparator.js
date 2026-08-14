@@ -263,6 +263,24 @@ export function sideHealth(side, policy, now = Date.now()) {
     sourceHealth.lastLiveAgeMs = live.ageMs;
     sourceHealth.lastEnhancedRefreshAt = enhanced.value;
     sourceHealth.lastEnhancedAgeMs = enhanced.ageMs;
+    const liveRefresh = safeDocument.liveRefresh;
+    sourceHealth.liveRefresh = liveRefresh && typeof liveRefresh === "object"
+      && !Array.isArray(liveRefresh)
+      ? {
+        attempts: Number(liveRefresh.attempts) || 0,
+        successes: Number(liveRefresh.successes) || 0,
+        failures: Number(liveRefresh.failures) || 0,
+        timeouts: Number(liveRefresh.timeouts) || 0,
+        retries: Number(liveRefresh.retries) || 0,
+        skippedBusy: Number(liveRefresh.skippedBusy) || 0,
+        consecutiveFailures: Number(liveRefresh.consecutiveFailures) || 0,
+        lastDurationMs: Number.isFinite(Number(liveRefresh.lastDurationMs))
+          ? Number(liveRefresh.lastDurationMs)
+          : null,
+        lastError: liveRefresh.lastError ?? null,
+        backoffMs: Number(liveRefresh.backoffMs) || 0,
+      }
+      : null;
   }
 
   return {
@@ -362,6 +380,9 @@ export function createStats() {
     invalidSamples: 0,
     // Kept for compatibility. Warmup is intentionally not counted as stale.
     staleSamples: 0,
+    invalidEpisodeCount: 0,
+    invalidEpisodeTotalMs: 0,
+    invalidEpisodeMaxMs: 0,
     invalidSamplesByReason: {},
     normalOnlyMax: 0,
     directOnlyMax: 0,
@@ -373,6 +394,7 @@ export function createStats() {
     inPlay: fieldCounts(),
     startTime: fieldCounts(),
     allFields: fieldCounts(),
+    _invalidEpisodeStartedAt: null,
   };
 }
 
@@ -380,7 +402,18 @@ function incrementReasons(target, reasons) {
   for (const reason of reasons) target[reason] = (target[reason] ?? 0) + 1;
 }
 
-export function recordSample(stats, { warmup, sampleValid, invalidReasons = [], comparison = null }) {
+function closeInvalidEpisode(stats, at = Date.now()) {
+  if (stats._invalidEpisodeStartedAt === null) return;
+  const durationMs = Math.max(0, at - stats._invalidEpisodeStartedAt);
+  stats.invalidEpisodeTotalMs += durationMs;
+  stats.invalidEpisodeMaxMs = Math.max(stats.invalidEpisodeMaxMs, durationMs);
+  stats._invalidEpisodeStartedAt = null;
+}
+
+export function recordSample(
+  stats,
+  { warmup, sampleValid, invalidReasons = [], comparison = null, at = Date.now() },
+) {
   stats.samples += 1;
   if (warmup) {
     stats.warmupSamples += 1;
@@ -388,12 +421,17 @@ export function recordSample(stats, { warmup, sampleValid, invalidReasons = [], 
   }
   stats.eligibleSamples += 1;
   if (!sampleValid || !comparison) {
+    if (stats._invalidEpisodeStartedAt === null) {
+      stats._invalidEpisodeStartedAt = at;
+      stats.invalidEpisodeCount += 1;
+    }
     stats.invalidSamples += 1;
     stats.staleSamples += 1;
     incrementReasons(stats.invalidSamplesByReason, invalidReasons);
     return;
   }
 
+  closeInvalidEpisode(stats, at);
   stats.readySamples += 1;
   stats.validSamples += 1;
   stats.normalOnlyMax = Math.max(stats.normalOnlyMax, comparison.normalOnly);
@@ -409,8 +447,12 @@ export function recordSample(stats, { warmup, sampleValid, invalidReasons = [], 
 }
 
 export function summarizedStats(stats) {
+  const { _invalidEpisodeStartedAt, ...publicStats } = stats;
   return {
-    ...stats,
+    ...publicStats,
+    activeInvalidMs: _invalidEpisodeStartedAt === null
+      ? 0
+      : Math.max(0, Date.now() - _invalidEpisodeStartedAt),
     readinessRatio: stats.eligibleSamples > 0 ? stats.readySamples / stats.eligibleSamples : null,
     odds: withAgreementRatio(stats.odds),
     status: withAgreementRatio(stats.status),
@@ -460,7 +502,7 @@ export async function main(config = CONFIG) {
       ? compareSnapshots(normal.document, direct.document, config.provider)
       : null;
 
-    recordSample(stats, { warmup, sampleValid, invalidReasons, comparison });
+    recordSample(stats, { warmup, sampleValid, invalidReasons, comparison, at: now });
     const item = {
       at: new Date(now).toISOString(),
       provider: config.provider,
@@ -479,6 +521,7 @@ export async function main(config = CONFIG) {
     await sleep(config.intervalMs);
   }
 
+  closeInvalidEpisode(stats, Date.now());
   const summary = {
     provider: config.provider,
     startedAt: new Date(startedAt).toISOString(),

@@ -639,6 +639,7 @@ A forráskód CDP-alapértéke `9222`; a `headless_primary.ps1` induláskor mind
 | Változó | Alapérték |
 |---|---|
 | `SHARPX_CDP_ENDPOINT` | `http://127.0.0.1:9222` |
+| `SHARPX_CDP_COMMAND_TIMEOUT_MS` | `60000` |
 | `TIPPMIXPRO_CDP_ENDPOINT` | `http://127.0.0.1:9222` |
 | `VEGAS_CDP_ENDPOINT` | `http://127.0.0.1:9222` |
 | `SHARPX_PREMATCH_MIN_MATCHED` | `300` EUR |
@@ -653,6 +654,9 @@ A forráskód CDP-alapértéke `9222`; a `headless_primary.ps1` induláskor mind
 | `SHARPX_WEBSOCKET_RECONNECT_BASE_MS` | `1000` |
 | `SHARPX_WEBSOCKET_RECONNECT_MAX_MS` | `10000` |
 | `SHARPX_ALL_SOCKET_RECOVERY_MS` | `30000` |
+| `SHARPX_OUTPUT_MIN_COVERAGE_RATIO` | `0.90` |
+| `SHARPX_LAST_GOOD_OUTPUT_TTL_MS` | `300000` |
+| `SHARPX_OUTPUT_STATE_FILE` | `data\\sharpx_output_state.json` |
 | `BOOKMAKER_SNAPSHOT_MAX_AGE_MS` | `10000` |
 | `SNAPSHOT_FUTURE_TOLERANCE_MS` | `5000` |
 | `TIPPMIXPRO_SOURCE_MAX_AGE_MS` | `30000` |
@@ -664,6 +668,14 @@ A forráskód CDP-alapértéke `9222`; a `headless_primary.ps1` induláskor mind
 | `VEGAS_OUTPUT_INTERVAL_MS` | `1000` |
 | `VEGAS_LIVE_REFRESH_MS` | `1000` |
 | `VEGAS_MATCHED_REFRESH_MS` | `5000` |
+| `VEGAS_LIVE_REQUEST_RETRIES` | `1` |
+| `VEGAS_LIVE_RETRY_DELAY_MS` | `150` |
+| `VEGAS_LIVE_REQUEST_BUDGET_MS` | `4500` összesített live request budget |
+| `VEGAS_LIVE_FAILURE_BACKOFF_MS` | `500` |
+| `VEGAS_LIVE_FAILURE_BACKOFF_MAX_MS` | `5000` |
+| `VEGAS_MATCHED_REQUEST_TIMEOUT_MS` | `8000` |
+| `VEGAS_MATCHED_REQUEST_RETRIES` | `1` |
+| `VEGAS_MATCHED_RETRY_DELAY_MS` | `250` |
 | `VEGAS_CATALOGUE_REFRESH_MS` | `300000` |
 | `VEGAS_REQUEST_TIMEOUT_MS` | `15000` |
 | `VEGAS_LIVE_REQUEST_TIMEOUT_MS` | `3000` |
@@ -725,8 +737,13 @@ Implemented since the previous audit:
   temporarily omits `startTime` or status. The snapshot exposes optional
   `snapshotConsistency.recoveredEvents`; genuinely incomplete events without a
   previous complete record still fail closed.
-- Vegas uses `VEGAS_LIVE_REQUEST_TIMEOUT_MS=3000` for fast live retries while
-  catalogue/detail requests retain the 15-second generic timeout.
+- Vegas uses a bounded live retry (`VEGAS_LIVE_REQUEST_TIMEOUT_MS=3000`, one
+  retry, `VEGAS_LIVE_REQUEST_BUDGET_MS=4500`) and a separate 8-second
+  targeted-event timeout. Live refreshes are non-overlapping and use bounded
+  failure backoff. The snapshot exposes live attempt/success/failure/timeout
+  telemetry. Direct Vegas targeted refreshes run in the background, so a
+  `GetEventsById` timeout cannot stop the one-second snapshot heartbeat;
+  successful batches are retained when another batch fails.
 - `start_all_direct_shadow_test.ps1` and
   `start_sharpx_direct_shadow_test.ps1` remain watchdogs until the shared
   deadline, then clean only their own resources and write `completedAt` and
@@ -796,6 +813,12 @@ külön canaryja sikeres és az összes kanonikus output ownership egyértelmű.
   timeout esetén kontrollált reconnect indul. Ha minden socket egyszerre
   egészségtelen, a monitor collector-recoveryt indít. Üres, `0/N` SharpX
   snapshot nem írja felül az utolsó jó odds- és surebet-kimenetet.
+- A SharpX output legalább 90%-os initialized/subscribed coverage mellett
+  publikálható. Coverage-hiba esetén bounded, legfeljebb 5 perces
+  last-known-good output marad aktív; utána fail-closed `UNAVAILABLE` output
+  készül. A `sharpx_output_state.json` újraindítás után is megőrzi a legutóbbi
+  jó output időpontját, a status snapshot és a Docker healthcheck pedig az
+  `outputHealth` állapotot ellenőrzi.
 
 ### Kötelező implementációs elemek a következő sessionben
 

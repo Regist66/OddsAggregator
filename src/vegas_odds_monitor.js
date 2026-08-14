@@ -54,6 +54,48 @@ const CONFIG = {
     min: 100,
     max: 120_000,
   }),
+  liveRequestRetries: envNumber("VEGAS_LIVE_REQUEST_RETRIES", 1, {
+    integer: true,
+    min: 0,
+    max: 3,
+  }),
+  liveRetryDelayMs: envNumber("VEGAS_LIVE_RETRY_DELAY_MS", 150, {
+    integer: true,
+    min: 0,
+    max: 5_000,
+  }),
+  // The retry budget is bounded as a whole. Without this cap, a 3s timeout
+  // plus one retry could keep lastLiveRefreshAt stale for more than 6s.
+  liveRequestBudgetMs: envNumber("VEGAS_LIVE_REQUEST_BUDGET_MS", 4_500, {
+    integer: true,
+    min: 100,
+    max: 120_000,
+  }),
+  liveFailureBackoffMs: envNumber("VEGAS_LIVE_FAILURE_BACKOFF_MS", 500, {
+    integer: true,
+    min: 0,
+    max: 60_000,
+  }),
+  liveFailureBackoffMaxMs: envNumber("VEGAS_LIVE_FAILURE_BACKOFF_MAX_MS", 5_000, {
+    integer: true,
+    min: 0,
+    max: 120_000,
+  }),
+  matchedRequestTimeoutMs: envNumber("VEGAS_MATCHED_REQUEST_TIMEOUT_MS", 8_000, {
+    integer: true,
+    min: 100,
+    max: 120_000,
+  }),
+  matchedRequestRetries: envNumber("VEGAS_MATCHED_REQUEST_RETRIES", 1, {
+    integer: true,
+    min: 0,
+    max: 3,
+  }),
+  matchedRetryDelayMs: envNumber("VEGAS_MATCHED_RETRY_DELAY_MS", 250, {
+    integer: true,
+    min: 0,
+    max: 5_000,
+  }),
   requestTimeoutMs: envNumber("VEGAS_REQUEST_TIMEOUT_MS", 15_000, {
     integer: true,
     min: 100,
@@ -76,9 +118,64 @@ const EVENT_TIME_BUCKET_MS = 30 * 60_000;
 const sleep = milliseconds =>
   new Promise(resolve => setTimeout(resolve, milliseconds));
 
+function createMonitorDiagnostics() {
+  return {
+    version: 1,
+    startedAt: Date.now(),
+    cdp: {
+      connectAttempts: 0,
+      connectSuccesses: 0,
+      connectFailures: 0,
+      connectTimeouts: 0,
+      commandTimeouts: 0,
+      commandErrors: 0,
+      unexpectedDisconnects: 0,
+      contextTimeouts: 0,
+    },
+    initialization: {
+      attempts: 0,
+      successes: 0,
+      failures: 0,
+    },
+    matchedRefresh: {
+      runs: 0,
+      errors: 0,
+    },
+    output: {
+      cycles: 0,
+      errors: 0,
+    },
+    lastErrorAt: null,
+    lastError: null,
+    lastEvent: null,
+  };
+}
+
+function incrementDiagnostic(diagnostics, section, field, details = {}) {
+  diagnostics[section][field] = Number(diagnostics[section][field] ?? 0) + 1;
+  diagnostics.lastEvent = {
+    at: Date.now(),
+    section,
+    field,
+    ...details,
+  };
+}
+
+function recordDiagnosticError(diagnostics, error, details = {}) {
+  diagnostics.lastErrorAt = Date.now();
+  diagnostics.lastError = String(error?.message ?? error);
+  diagnostics.lastEvent = {
+    at: diagnostics.lastErrorAt,
+    type: "error",
+    ...details,
+    message: diagnostics.lastError,
+  };
+}
+
 class CdpClient {
-  constructor(webSocketUrl) {
+  constructor(webSocketUrl, diagnostics) {
     this.webSocketUrl = webSocketUrl;
+    this.diagnostics = diagnostics;
     this.socket = null;
     this.nextId = 0;
     this.pending = new Map();
@@ -91,6 +188,7 @@ class CdpClient {
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(
         () => {
+          incrementDiagnostic(this.diagnostics, "cdp", "connectTimeouts");
           reject(new Error("Vegas CDP kapcsolódási időtúllépés."));
           this.socket?.close();
         },
@@ -122,6 +220,7 @@ class CdpClient {
     const result = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (!this.pending.delete(id)) return;
+        incrementDiagnostic(this.diagnostics, "cdp", "commandTimeouts", { method });
         reject(new Error(`Vegas CDP parancs időtúllépés: ${method}`));
         try {
           this.socket?.close();
@@ -129,7 +228,7 @@ class CdpClient {
           // A socket már bezáródhatott a timeouttal párhuzamosan.
         }
       }, CONFIG.cdpCommandTimeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer, method });
     });
     this.socket.send(JSON.stringify({ id, method, params }));
     return result;
@@ -147,6 +246,7 @@ class CdpClient {
       if (context) return context.id;
       await sleep(100);
     }
+    incrementDiagnostic(this.diagnostics, "cdp", "contextTimeouts");
     throw new Error("Nem található a vegas.hu fő execution contextje.");
   }
 
@@ -183,7 +283,12 @@ class CdpClient {
       const pending = this.pending.get(message.id);
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
-      if (message.error) pending.reject(new Error(JSON.stringify(message.error)));
+      if (message.error) {
+        incrementDiagnostic(this.diagnostics, "cdp", "commandErrors", {
+          method: pending.method,
+        });
+        pending.reject(new Error(JSON.stringify(message.error)));
+      }
       else pending.resolve(message.result);
       return;
     }
@@ -199,6 +304,7 @@ class CdpClient {
 
   #onClose() {
     if (this.closed) return;
+    incrementDiagnostic(this.diagnostics, "cdp", "unexpectedDisconnects");
     for (const { reject, timer } of this.pending.values()) {
       clearTimeout(timer);
       reject(new Error("A Vegas CDP kapcsolat váratlanul megszakadt."));
@@ -232,6 +338,14 @@ export function browserCollectorSource() {
     enhancedRefreshMs: CONFIG.matchedRefreshMs,
     requestTimeoutMs: CONFIG.requestTimeoutMs,
     liveRequestTimeoutMs: CONFIG.liveRequestTimeoutMs,
+    liveRequestRetries: CONFIG.liveRequestRetries,
+    liveRetryDelayMs: CONFIG.liveRetryDelayMs,
+    liveRequestBudgetMs: CONFIG.liveRequestBudgetMs,
+    liveFailureBackoffMs: CONFIG.liveFailureBackoffMs,
+    liveFailureBackoffMaxMs: CONFIG.liveFailureBackoffMaxMs,
+    matchedRequestTimeoutMs: CONFIG.matchedRequestTimeoutMs,
+    matchedRequestRetries: CONFIG.matchedRequestRetries,
+    matchedRetryDelayMs: CONFIG.matchedRetryDelayMs,
     timezoneOffsetMinutes: CONFIG.timezoneOffsetMinutes,
   });
 
@@ -255,6 +369,25 @@ export function browserCollectorSource() {
       liveBusy: false,
       enhancedBusy: false,
       matchedEventsBusy: false,
+      stopped: false,
+      liveTimer: null,
+      liveRefresh: {
+        attempts: 0,
+        successes: 0,
+        failures: 0,
+        timeouts: 0,
+        retries: 0,
+        skippedBusy: 0,
+        consecutiveFailures: 0,
+        lastStartedAt: null,
+        lastCompletedAt: null,
+        lastSuccessAt: null,
+        lastFailureAt: null,
+        lastDurationMs: null,
+        lastError: null,
+        backoffMs: 0,
+        nextAttemptAt: null,
+      },
       timers: [],
 
       query() {
@@ -287,6 +420,42 @@ export function browserCollectorSource() {
         } finally {
           clearTimeout(timeout);
         }
+      },
+
+      async requestWithRetry(
+        endpoint,
+        parameters = "",
+        timeoutMs = options.requestTimeoutMs,
+        retries = 0,
+        retryDelayMs = 0,
+        requestOptions = {},
+      ) {
+        const totalTimeoutMs = Number.isFinite(requestOptions.totalTimeoutMs)
+          ? requestOptions.totalTimeoutMs
+          : null;
+        const deadline = totalTimeoutMs === null ? null : Date.now() + totalTimeoutMs;
+        let lastError;
+        for (let attempt = 0; attempt <= retries; attempt += 1) {
+          const remainingMs = deadline === null ? timeoutMs : deadline - Date.now();
+          if (remainingMs <= 0) break;
+          try {
+            return await this.request(
+              endpoint,
+              parameters,
+              Math.max(1, Math.min(timeoutMs, remainingMs)),
+            );
+          } catch (error) {
+            lastError = error;
+            if (attempt >= retries) break;
+            requestOptions.onRetry?.({ attempt: attempt + 1, error });
+            const availableForDelay = deadline === null
+              ? retryDelayMs
+              : Math.max(0, deadline - Date.now() - 1);
+            const delayMs = Math.min(retryDelayMs, availableForDelay);
+            if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+          }
+        }
+        throw lastError ?? new Error(endpoint + " kérés sikertelen");
       },
 
       isOneXTwoMarket(market, selections, enhanced = false) {
@@ -422,24 +591,40 @@ export function browserCollectorSource() {
           for (let start = 0; start < uniqueIds.length; start += 50) {
             batches.push(uniqueIds.slice(start, start + 50));
           }
-          const payloads = await Promise.all(
+          const payloads = await Promise.allSettled(
             batches.map(batch =>
-              this.request("GetEventsById", "&eventIds=" + batch.join(",")),
+              this.requestWithRetry(
+                "GetEventsById",
+                "&eventIds=" + batch.join(","),
+                options.matchedRequestTimeoutMs,
+                options.matchedRequestRetries,
+                options.matchedRetryDelayMs,
+              ),
             ),
           );
           const refreshedEvents = new Map();
+          let failedBatches = 0;
           for (const payload of payloads) {
-            this.mapPayload(payload, "prematch", refreshedEvents);
+            if (payload.status === "fulfilled") {
+              this.mapPayload(payload.value, "prematch", refreshedEvents);
+            } else {
+              failedBatches += 1;
+            }
           }
           for (const [id, event] of refreshedEvents) {
             // A catalogue refresh may have completed while the targeted request
             // was in flight. Recheck before merging its response.
             if (this.availableEventIds.has(id)) this.events.set(id, event);
           }
+          if (failedBatches > 0) {
+            this.lastError =
+              "GetEventsById: " + failedBatches + " batch lekérése sikertelen";
+          }
           return {
             refreshedEvents: [...refreshedEvents.keys()]
               .filter(id => this.availableEventIds.has(id)).length,
             skippedUnavailableEvents: requestedIds.length - uniqueIds.length,
+            failedBatches,
           };
         } finally {
           this.matchedEventsBusy = false;
@@ -447,13 +632,26 @@ export function browserCollectorSource() {
       },
 
       async refreshLive() {
-        if (this.liveBusy) return;
+        if (this.liveBusy) {
+          this.liveRefresh.skippedBusy += 1;
+          return { ok: false, busy: true, backoffMs: options.liveRefreshMs };
+        }
+        const startedAt = Date.now();
+        this.liveRefresh.attempts += 1;
+        this.liveRefresh.lastStartedAt = startedAt;
+        this.liveRefresh.nextAttemptAt = null;
         this.liveBusy = true;
         try {
-          const payload = await this.request(
+          const payload = await this.requestWithRetry(
             "GetLiveOverview",
             "&sportId=66",
             options.liveRequestTimeoutMs,
+            options.liveRequestRetries,
+            options.liveRetryDelayMs,
+            {
+              totalTimeoutMs: options.liveRequestBudgetMs,
+              onRetry: () => { this.liveRefresh.retries += 1; },
+            },
           );
           const currentIds = new Set(this.mapPayload(payload, "live"));
           for (const id of this.liveEventIds) {
@@ -461,9 +659,44 @@ export function browserCollectorSource() {
           }
           this.liveEventIds = currentIds;
           for (const id of currentIds) this.availableEventIds.add(id);
-          this.lastLiveRefreshAt = Date.now();
+          const completedAt = Date.now();
+          this.lastLiveRefreshAt = completedAt;
+          this.liveRefresh.successes += 1;
+          this.liveRefresh.consecutiveFailures = 0;
+          this.liveRefresh.lastCompletedAt = completedAt;
+          this.liveRefresh.lastSuccessAt = completedAt;
+          this.liveRefresh.lastDurationMs = completedAt - startedAt;
+          this.liveRefresh.lastError = null;
+          this.liveRefresh.backoffMs = 0;
+          this.liveRefresh.nextAttemptAt = completedAt + options.liveRefreshMs;
+          return {
+            ok: true,
+            events: currentIds.size,
+            durationMs: completedAt - startedAt,
+            backoffMs: options.liveRefreshMs,
+          };
         } catch (error) {
+          const completedAt = Date.now();
+          const message = String(error?.message ?? error);
+          this.liveRefresh.failures += 1;
+          if (/idő?túllépés|timeout|abort/i.test(message)) this.liveRefresh.timeouts += 1;
+          this.liveRefresh.consecutiveFailures += 1;
+          this.liveRefresh.lastCompletedAt = completedAt;
+          this.liveRefresh.lastFailureAt = completedAt;
+          this.liveRefresh.lastDurationMs = completedAt - startedAt;
+          this.liveRefresh.lastError = message;
+          this.liveRefresh.backoffMs = Math.min(
+            options.liveFailureBackoffMaxMs,
+            options.liveFailureBackoffMs * 2 ** Math.min(this.liveRefresh.consecutiveFailures - 1, 8),
+          );
+          this.liveRefresh.nextAttemptAt = completedAt + this.liveRefresh.backoffMs;
           this.lastError = error.message;
+          return {
+            ok: false,
+            error: message,
+            durationMs: completedAt - startedAt,
+            backoffMs: this.liveRefresh.backoffMs,
+          };
         } finally {
           this.liveBusy = false;
         }
@@ -588,6 +821,7 @@ export function browserCollectorSource() {
           generatedAt: Date.now(),
           lastCatalogueRefreshAt: this.lastCatalogueRefreshAt,
           lastLiveRefreshAt: this.lastLiveRefreshAt,
+          liveRefresh: { ...this.liveRefresh },
           lastEnhancedRefreshAt: this.lastEnhancedRefreshAt,
           lastError: this.lastError,
           catalogueEvents: this.events.size,
@@ -600,8 +834,23 @@ export function browserCollectorSource() {
       },
 
       shutdown() {
+        this.stopped = true;
+        if (this.liveTimer) clearTimeout(this.liveTimer);
+        this.liveTimer = null;
         for (const timer of this.timers) clearInterval(timer);
         this.timers = [];
+      },
+
+      scheduleLiveRefresh(delayMs = options.liveRefreshMs) {
+        if (this.stopped || this.liveTimer) return;
+        const delay = Math.max(0, Number(delayMs) || 0);
+        this.liveRefresh.nextAttemptAt = Date.now() + delay;
+        this.liveTimer = setTimeout(async () => {
+          this.liveTimer = null;
+          if (this.stopped) return;
+          const result = await this.refreshLive();
+          this.scheduleLiveRefresh(result.backoffMs ?? options.liveRefreshMs);
+        }, delay);
       },
     };
 
@@ -612,7 +861,6 @@ export function browserCollectorSource() {
       });
     };
     collector.timers.push(
-      setInterval(() => runSafely("live", () => collector.refreshLive()), options.liveRefreshMs),
       setInterval(
         () => runSafely("enhanced", () => collector.refreshEnhancedOdds()),
         options.enhancedRefreshMs,
@@ -622,6 +870,7 @@ export function browserCollectorSource() {
         options.catalogueRefreshMs,
       ),
     );
+    collector.scheduleLiveRefresh(options.liveRefreshMs);
     return true;
   })()`;
 }
@@ -818,15 +1067,24 @@ async function main() {
   let selectedIds = [];
   let lastStatus = "";
   let initializationPromise = null;
+  const diagnostics = createMonitorDiagnostics();
 
   const connectCdp = async (force = false) => {
     if (!force && cdp?.socket?.readyState === WebSocket.OPEN) return;
+    incrementDiagnostic(diagnostics, "cdp", "connectAttempts");
     cdp?.close();
-    const target = await findVegasTarget();
-    const nextClient = new CdpClient(target.webSocketDebuggerUrl);
-    await nextClient.connect();
-    cdp = nextClient;
-    contextId = undefined;
+    try {
+      const target = await findVegasTarget();
+      const nextClient = new CdpClient(target.webSocketDebuggerUrl, diagnostics);
+      await nextClient.connect();
+      cdp = nextClient;
+      contextId = undefined;
+      incrementDiagnostic(diagnostics, "cdp", "connectSuccesses");
+    } catch (error) {
+      incrementDiagnostic(diagnostics, "cdp", "connectFailures");
+      recordDiagnosticError(diagnostics, error, { section: "cdp", field: "connectFailures" });
+      throw error;
+    }
   };
 
   const stop = async exitCode => {
@@ -867,20 +1125,24 @@ async function main() {
     initializationPromise = (async () => {
       let attempt = 0;
       while (!stopping) {
+        incrementDiagnostic(diagnostics, "initialization", "attempts");
         try {
           if (cdp?.socket?.readyState !== WebSocket.OPEN || attempt > 0) {
             await connectCdp(attempt > 0);
           }
           await initialize();
+          incrementDiagnostic(diagnostics, "initialization", "successes");
           return true;
         } catch (error) {
           attempt += 1;
+          recordDiagnosticError(diagnostics, error, { section: "initialization", field: "attempts" });
           // A Vegas oldal első betöltésekor a CDP execution context navigáció
           // közben megszűnhet. Új target-kapcsolattal próbálkozunk tovább.
           console.error(`[initialize] ${error.message}; újrapróbálás 1 mp múlva.`);
           await sleep(1_000);
         }
       }
+      incrementDiagnostic(diagnostics, "initialization", "failures");
       return false;
     })().finally(() => {
       initializationPromise = null;
@@ -891,6 +1153,7 @@ async function main() {
   const refreshMatchedEvents = async () => {
     if (refreshingMatchedEvents || stopping || writing || initializationPromise) return;
     refreshingMatchedEvents = true;
+    incrementDiagnostic(diagnostics, "matchedRefresh", "runs");
     try {
       await refreshTeamAliases();
       const watchlist = await readJson(CONFIG.watchlistFile);
@@ -919,6 +1182,8 @@ async function main() {
         );
       }
     } catch (error) {
+      incrementDiagnostic(diagnostics, "matchedRefresh", "errors");
+      recordDiagnosticError(diagnostics, error, { section: "matchedRefresh", field: "errors" });
       console.error(`[matched-refresh] ${error.message}`);
       await initializeWithRetry();
     } finally {
@@ -929,12 +1194,20 @@ async function main() {
   const writeOutput = async () => {
     if (writing || stopping || refreshingMatchedEvents || initializationPromise) return;
     writing = true;
+    incrementDiagnostic(diagnostics, "output", "cycles");
     try {
       const snapshot = await cdp.evaluate(
         `globalThis.__vegasSoccerCollector.snapshot(${JSON.stringify(selectedIds)})`,
         contextId,
       );
-      await writeAtomically(CONFIG.outputFile, `${JSON.stringify(snapshot, null, 2)}\n`);
+      const output = {
+        ...snapshot,
+        monitorHealth: {
+          ...diagnostics,
+          updatedAt: Date.now(),
+        },
+      };
+      await writeAtomically(CONFIG.outputFile, `${JSON.stringify(output, null, 2)}\n`);
       const status =
         `${snapshot.events.length} selected/live, ` +
         `${snapshot.catalogueEvents} catalogue, ${snapshot.liveEvents} live`;
@@ -943,6 +1216,8 @@ async function main() {
         console.log(`[output] ${status} -> ${CONFIG.outputFile}`);
       }
     } catch (error) {
+      incrementDiagnostic(diagnostics, "output", "errors");
+      recordDiagnosticError(diagnostics, error, { section: "output", field: "errors" });
       console.error(`[output] ${error.message}`);
       if (!error?.isOutputError) await initializeWithRetry();
     } finally {

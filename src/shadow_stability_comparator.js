@@ -79,6 +79,11 @@ const state = {
     detectionDelaysMs: [],
     significantDisagreements: [],
   },
+  telemetry: {
+    freshness: {},
+    coverage: {},
+    diagnostics: { normal: {}, headless: {} },
+  },
   evidenceSequence: 0,
 };
 
@@ -165,6 +170,9 @@ async function readOutput(root, descriptor) {
         events: Array.isArray(document.events) ? document.events : [],
         markets: Array.isArray(document.markets) ? document.markets : [],
         generatedAt: Number(document.generatedAt) || null,
+        monitorHealth: document.monitorHealth ?? document.diagnostics ?? null,
+        outputHealth: document.outputHealth ?? null,
+        connectionHealth: document.connectionHealth ?? null,
       };
     }
     return {
@@ -216,6 +224,48 @@ function outputStale(name, output) {
   if (OUTPUTS[name].kind === "status") return !output.ok;
   const threshold = OUTPUTS[name].kind === "snapshot" ? CONFIG.staleSnapshotMs : CONFIG.staleTextMs;
   return !output.ok || output.ageMs > threshold;
+}
+
+function trackTelemetry(side, outputs) {
+  state.telemetry.freshness[side] ??= {};
+  for (const [name, output] of Object.entries(outputs)) {
+    const entry = state.telemetry.freshness[side][name] ?? {
+      samples: 0,
+      staleSamples: 0,
+      maxAgeMs: null,
+    };
+    entry.samples += 1;
+    if (!output.ok || outputStale(name, output)) entry.staleSamples += 1;
+    if (Number.isFinite(output.ageMs)) {
+      entry.maxAgeMs = Math.max(entry.maxAgeMs ?? 0, output.ageMs);
+    }
+    state.telemetry.freshness[side][name] = entry;
+  }
+
+  const sharpX = outputs.sharpxStatus;
+  const coverageRatio = Number(sharpX?.outputHealth?.coverageRatio);
+  if (Number.isFinite(coverageRatio)) {
+    const coverage = state.telemetry.coverage[side] ?? {
+      samples: 0,
+      belowMinimumSamples: 0,
+      minimumCoverageRatio: Number(sharpX.outputHealth.minimumCoverageRatio) || null,
+      minCoverageRatio: null,
+      latestCoverageRatio: null,
+    };
+    coverage.samples += 1;
+    coverage.latestCoverageRatio = coverageRatio;
+    coverage.minCoverageRatio = Math.min(coverage.minCoverageRatio ?? 1, coverageRatio);
+    coverage.minimumCoverageRatio =
+      Number(sharpX.outputHealth.minimumCoverageRatio) || coverage.minimumCoverageRatio;
+    if (
+      coverage.minimumCoverageRatio !== null &&
+      coverageRatio < coverage.minimumCoverageRatio
+    ) coverage.belowMinimumSamples += 1;
+    state.telemetry.coverage[side] = coverage;
+  }
+
+  state.telemetry.diagnostics[side].sharpx = sharpX?.monitorHealth ?? null;
+  state.telemetry.diagnostics[side].vegas = outputs.vegas?.monitorHealth ?? null;
 }
 
 async function trackStaleness(side, outputs) {
@@ -513,6 +563,8 @@ async function sample() {
   const normal = Object.fromEntries(normalEntries);
   const headless = Object.fromEntries(headlessEntries);
   state.stats.samples += 1;
+  trackTelemetry("normal", normal);
+  trackTelemetry("headless", headless);
   await mirrorHeadlessSurebets(headless.surebets);
   const requiredOutputs = Object.entries(OUTPUTS)
     .filter(([, descriptor]) => descriptor.requiredFresh !== false)
@@ -542,8 +594,24 @@ async function sample() {
     await appendJsonLine(files.health, {
       at: new Date().toISOString(),
       ready,
-      normal: Object.fromEntries(Object.entries(normal).map(([name, output]) => [name, { ageMs: output.ageMs, ok: output.ok, eventCount: output.eventCount ?? null, surebetCount: output.candidates?.size ?? null }])),
-      headless: Object.fromEntries(Object.entries(headless).map(([name, output]) => [name, { ageMs: output.ageMs, ok: output.ok, eventCount: output.eventCount ?? null, surebetCount: output.candidates?.size ?? null }])),
+      normal: Object.fromEntries(Object.entries(normal).map(([name, output]) => [name, {
+        ageMs: output.ageMs,
+        ok: output.ok,
+        eventCount: output.eventCount ?? null,
+        surebetCount: output.candidates?.size ?? null,
+        monitorHealth: output.monitorHealth ?? null,
+        outputHealth: output.outputHealth ?? null,
+        connectionHealth: output.connectionHealth ?? null,
+      }])),
+      headless: Object.fromEntries(Object.entries(headless).map(([name, output]) => [name, {
+        ageMs: output.ageMs,
+        ok: output.ok,
+        eventCount: output.eventCount ?? null,
+        surebetCount: output.candidates?.size ?? null,
+        monitorHealth: output.monitorHealth ?? null,
+        outputHealth: output.outputHealth ?? null,
+        connectionHealth: output.connectionHealth ?? null,
+      }])),
     });
   }
 }
@@ -565,6 +633,7 @@ async function writeSummary() {
   const endedAt = Date.now();
   const { detectionDelaysMs, significantDisagreements, ...counts } = state.stats;
   const summary = {
+    completionStatus: "completed",
     startedAt: new Date(state.startedAt).toISOString(),
     endedAt: new Date(endedAt).toISOString(),
     durationSeconds: Math.round((endedAt - state.startedAt) / 1000),
@@ -574,6 +643,9 @@ async function writeSummary() {
     medianDetectionDelayMs: median(detectionDelaysMs),
     p95DetectionDelayMs: percentile(detectionDelaysMs, 0.95),
     significantDisagreementCount: significantDisagreements.length,
+    snapshotFreshness: state.telemetry.freshness,
+    sharpXCoverage: state.telemetry.coverage,
+    monitorDiagnostics: state.telemetry.diagnostics,
     topDisagreements: [...significantDisagreements]
       .sort((left, right) => right.edge - left.edge)
       .slice(0, 30),
@@ -597,6 +669,7 @@ async function writeSummary() {
     `- Helyreállt surebet-eltérések: ${summary.recoveredSurebets}`,
     `- Snapshot darabszám-eltérések: ${summary.snapshotMismatchEpisodes}`,
     `- Medián felismerési eltérés: ${summary.medianDetectionDelayMs === null ? "nincs közös surebet" : `${summary.medianDetectionDelayMs} ms`}`,
+    "- A `summary.json` tartalmazza a snapshot-frissesség, SharpX coverage, CDP és újrainicializálási metrikákat.",
     "",
     `A tartós eltérés legalább ${CONFIG.graceMs / 1000} másodpercig csak az egyik stackben jelen lévő, azonos esemény/bookmaker/kimenet surebet. Az evidence fájlban a \`surebetPresent\` és a \`missingFrom\` jelöli egyértelműen, melyik oldalon hiányzott.`,
   ].join("\n");

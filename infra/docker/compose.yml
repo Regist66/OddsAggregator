@@ -66,10 +66,14 @@ services:
       - ../../runtime/data:/app/data
     environment:
       SHARPX_CDP_ENDPOINT: http://127.0.0.1:9333
+      SHARPX_CDP_COMMAND_TIMEOUT_MS: "${SHARPX_CDP_COMMAND_TIMEOUT_MS:-60000}"
       SHARPX_OUTPUT_FILE: /app/data/combined_odds.txt
       SUREBETS_OUTPUT_FILE: /app/data/football/surebets_live_odds.txt
       SHARPX_WATCHLIST_FILE: /app/data/sharpx_watchlist.json
       SHARPX_STATUS_SNAPSHOT_FILE: /app/data/sharpx_status_snapshot.json
+      SHARPX_OUTPUT_STATE_FILE: /app/data/sharpx_output_state.json
+      SHARPX_OUTPUT_MIN_COVERAGE_RATIO: "${SHARPX_OUTPUT_MIN_COVERAGE_RATIO:-0.90}"
+      SHARPX_LAST_GOOD_OUTPUT_TTL_MS: "${SHARPX_LAST_GOOD_OUTPUT_TTL_MS:-300000}"
       SHARPX_WEBSOCKET_HANDSHAKE_TIMEOUT_MS: "${SHARPX_WEBSOCKET_HANDSHAKE_TIMEOUT_MS:-10000}"
       SHARPX_WEBSOCKET_FRAME_TIMEOUT_MS: "${SHARPX_WEBSOCKET_FRAME_TIMEOUT_MS:-30000}"
       SHARPX_WEBSOCKET_RECONNECT_BASE_MS: "${SHARPX_WEBSOCKET_RECONNECT_BASE_MS:-1000}"
@@ -79,6 +83,8 @@ services:
       VEGAS_SNAPSHOT_FILE: /app/data/vegas_odds_snapshot.json
       MONITOR_HEARTBEAT_FILE: /app/data/sharpx_status_snapshot.json
       MONITOR_STALE_MS: "${MONITOR_STALE_MS:-120000}"
+      MONITOR_VALIDATE_CONTENT: "1"
+      MONITOR_MIN_COVERAGE_RATIO: "${SHARPX_OUTPUT_MIN_COVERAGE_RATIO:-0.90}"
       MONITOR_STARTUP_GRACE_MS: "${MONITOR_STARTUP_GRACE_MS:-180000}"
       MONITOR_POLL_MS: "${MONITOR_POLL_MS:-10000}"
     command: ["node", "/usr/local/bin/monitor-supervisor.mjs", "src/sharpx_odds_monitor.js"]
@@ -105,6 +111,9 @@ services:
       VEGAS_CDP_ENDPOINT: http://127.0.0.1:9333
       VEGAS_OUTPUT_FILE: /app/data/vegas_odds_snapshot.json
       VEGAS_SNAPSHOT_FILE: /app/data/vegas_odds_snapshot.json
+      VEGAS_LIVE_REQUEST_BUDGET_MS: "${VEGAS_LIVE_REQUEST_BUDGET_MS:-4500}"
+      VEGAS_LIVE_FAILURE_BACKOFF_MS: "${VEGAS_LIVE_FAILURE_BACKOFF_MS:-500}"
+      VEGAS_LIVE_FAILURE_BACKOFF_MAX_MS: "${VEGAS_LIVE_FAILURE_BACKOFF_MAX_MS:-5000}"
       SHARPX_WATCHLIST_FILE: /app/data/sharpx_watchlist.json
       MONITOR_HEARTBEAT_FILE: /app/data/vegas_odds_snapshot.json
       MONITOR_STALE_MS: "${MONITOR_STALE_MS:-120000}"
