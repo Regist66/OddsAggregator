@@ -130,6 +130,122 @@ test("Vegas live refresh records bounded timeout failures and backoff", async ()
   }
 });
 
+test("Vegas enhanced details are watchlist-prioritized and concurrency-limited", async () => {
+  new Function(`return ${browserCollectorSource()};`)();
+  const collector = globalThis.__vegasSoccerCollector;
+  try {
+    const eventIds = Array.from({ length: 20 }, (_, index) => index + 1);
+    collector.availableEventIds = new Set(eventIds);
+    collector.setPriorityEventIds([1, 2]);
+    let active = 0;
+    let maximumActive = 0;
+    const requestedIds = [];
+    const enhancedPayload = {
+      markets: [{ id: 10, name: "1x2 - odds+", oddIds: [101, 102, 103] }],
+      odds: [
+        { id: 101, typeId: 1, price: 2, oddStatus: 0 },
+        { id: 102, typeId: 2, price: 3, oddStatus: 0 },
+        { id: 103, typeId: 3, price: 4, oddStatus: 0 },
+      ],
+      events: eventIds.map(id => ({
+        id,
+        sportId: 66,
+        marketIds: [10],
+        startDate: "2026-08-14T12:00:00.000Z",
+      })),
+    };
+    collector.request = async (endpoint, suffix) => {
+      if (endpoint === "GetEnhancedOdds") return enhancedPayload;
+      assert.equal(endpoint, "GetEventDetails");
+      const id = Number(new URLSearchParams(suffix.slice(1)).get("eventId"));
+      requestedIds.push(id);
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      active -= 1;
+      return {
+        id,
+        odds: [
+          { id: id * 10 + 1, typeId: 1, price: 2, oddStatus: 0 },
+          { id: id * 10 + 2, typeId: 2, price: 3, oddStatus: 0 },
+          { id: id * 10 + 3, typeId: 3, price: 4, oddStatus: 0 },
+        ],
+        markets: [{ name: "1x2", desktopOddIds: [id * 10 + 1, id * 10 + 2, id * 10 + 3] }],
+      };
+    };
+
+    const result = await collector.refreshEnhancedOdds();
+
+    assert.equal(result.detailRequests, 2);
+    assert.deepEqual(requestedIds.sort((left, right) => left - right), [1, 2]);
+    assert.ok(maximumActive <= 12);
+    assert.equal(collector.enhancedRefresh.detailSuccesses, 2);
+    assert.equal(collector.enhancedRefresh.detailFailures, 0);
+  } finally {
+    collector.shutdown();
+    delete globalThis.__vegasSoccerCollector;
+  }
+});
+
+test("Vegas enhanced refresh yields to a due live refresh", async () => {
+  new Function(`return ${browserCollectorSource()};`)();
+  const collector = globalThis.__vegasSoccerCollector;
+  try {
+    let requests = 0;
+    collector.livePriorityPending = true;
+    collector.request = async () => {
+      requests += 1;
+      return { events: [], markets: [], odds: [], competitors: [], champs: [] };
+    };
+
+    const result = await collector.refreshEnhancedOdds();
+
+    assert.deepEqual(result, { busy: true, reason: "live-priority" });
+    assert.equal(requests, 0);
+    assert.equal(collector.enhancedRefresh.pausedForLive, 1);
+  } finally {
+    collector.shutdown();
+    delete globalThis.__vegasSoccerCollector;
+  }
+});
+
+test("Vegas enhanced source timestamp stays fresh when detail fan-out pauses", async () => {
+  new Function(`return ${browserCollectorSource()};`)();
+  const collector = globalThis.__vegasSoccerCollector;
+  try {
+    collector.setPriorityEventIds([1]);
+    collector.availableEventIds = new Set([1]);
+    collector.request = async endpoint => {
+      assert.equal(endpoint, "GetEnhancedOdds");
+      collector.livePriorityPending = true;
+      return {
+        events: [{
+          id: 1,
+          sportId: 66,
+          marketIds: [10],
+          startDate: "2026-08-14T12:00:00.000Z",
+        }],
+        markets: [{ id: 10, name: "1x2 - odds+", oddIds: [101, 102, 103] }],
+        odds: [
+          { id: 101, typeId: 1, price: 2, oddStatus: 0 },
+          { id: 102, typeId: 2, price: 3, oddStatus: 0 },
+          { id: 103, typeId: 3, price: 4, oddStatus: 0 },
+        ],
+        competitors: [],
+        champs: [],
+      };
+    };
+
+    const result = await collector.refreshEnhancedOdds();
+
+    assert.equal(result.detailPausedForLive, true);
+    assert.ok(Number.isFinite(collector.lastEnhancedRefreshAt));
+  } finally {
+    collector.shutdown();
+    delete globalThis.__vegasSoccerCollector;
+  }
+});
+
 test("Vegas targeted refresh keeps successful batches when another batch fails", async () => {
   new Function(`return ${browserCollectorSource()};`)();
   const collector = globalThis.__vegasSoccerCollector;

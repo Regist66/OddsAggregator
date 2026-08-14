@@ -81,6 +81,11 @@ const CONFIG = {
     min: 0,
     max: 120_000,
   }),
+  enhancedDetailConcurrency: envNumber("VEGAS_ENHANCED_DETAIL_CONCURRENCY", 12, {
+    integer: true,
+    min: 1,
+    max: 64,
+  }),
   matchedRequestTimeoutMs: envNumber("VEGAS_MATCHED_REQUEST_TIMEOUT_MS", 8_000, {
     integer: true,
     min: 100,
@@ -343,6 +348,7 @@ export function browserCollectorSource() {
     liveRequestBudgetMs: CONFIG.liveRequestBudgetMs,
     liveFailureBackoffMs: CONFIG.liveFailureBackoffMs,
     liveFailureBackoffMaxMs: CONFIG.liveFailureBackoffMaxMs,
+    enhancedDetailConcurrency: CONFIG.enhancedDetailConcurrency,
     matchedRequestTimeoutMs: CONFIG.matchedRequestTimeoutMs,
     matchedRequestRetries: CONFIG.matchedRequestRetries,
     matchedRetryDelayMs: CONFIG.matchedRetryDelayMs,
@@ -361,12 +367,15 @@ export function browserCollectorSource() {
       availableEventIds: new Set(),
       liveEventIds: new Set(),
       enhancedEventIds: new Set(),
+      priorityEventIds: new Set(),
+      priorityEventIdsConfigured: false,
       lastCatalogueRefreshAt: null,
       lastLiveRefreshAt: null,
       lastEnhancedRefreshAt: null,
       lastError: null,
       catalogueBusy: false,
       liveBusy: false,
+      livePriorityPending: false,
       enhancedBusy: false,
       matchedEventsBusy: false,
       stopped: false,
@@ -388,6 +397,19 @@ export function browserCollectorSource() {
         backoffMs: 0,
         nextAttemptAt: null,
       },
+      enhancedRefresh: {
+        runs: 0,
+        successes: 0,
+        failures: 0,
+        detailRequests: 0,
+        detailSuccesses: 0,
+        detailFailures: 0,
+        pausedForLive: 0,
+        lastStartedAt: null,
+        lastCompletedAt: null,
+        lastDurationMs: null,
+        lastError: null,
+      },
       timers: [],
 
       query() {
@@ -399,6 +421,13 @@ export function browserCollectorSource() {
         return (
           "?culture=hu-HU&timezoneOffset=" + timezoneOffset +
           "&integration=vegas.hu&deviceType=1&numFormat=hu-HU&countryCode=LU"
+        );
+      },
+
+      setPriorityEventIds(eventIds) {
+        this.priorityEventIdsConfigured = true;
+        this.priorityEventIds = new Set(
+          (eventIds ?? []).map(Number).filter(Number.isFinite),
         );
       },
 
@@ -460,7 +489,7 @@ export function browserCollectorSource() {
 
       isOneXTwoMarket(market, selections, enhanced = false) {
         const name = String(market?.name ?? "")
-          .replace(/\s+/g, " ")
+          .replace(/\\s+/g, " ")
           .trim()
           .toLowerCase();
         const expectedName = enhanced ? "1x2 - odds+" : "1x2";
@@ -702,8 +731,45 @@ export function browserCollectorSource() {
         }
       },
 
+      async runWithConcurrency(items, concurrency, operation, shouldPause = () => false) {
+        const results = [];
+        let nextIndex = 0;
+        let paused = false;
+        const worker = async () => {
+          while (nextIndex < items.length) {
+            if (shouldPause()) {
+              paused = true;
+              return;
+            }
+            const index = nextIndex++;
+            try {
+              results[index] = {
+                status: "fulfilled",
+                value: await operation(items[index], index),
+              };
+            } catch (error) {
+              results[index] = { status: "rejected", reason: error };
+            }
+          }
+        };
+        await Promise.all(
+          Array.from(
+            { length: Math.min(Math.max(1, concurrency), items.length) },
+            () => worker(),
+          ),
+        );
+        return { results: results.filter(Boolean), paused };
+      },
+
       async refreshEnhancedOdds() {
-        if (this.enhancedBusy) return { busy: true };
+        if (this.enhancedBusy) return { busy: true, reason: "enhanced-busy" };
+        if (this.liveBusy || this.livePriorityPending) {
+          this.enhancedRefresh.pausedForLive += 1;
+          return { busy: true, reason: "live-priority" };
+        }
+        const startedAt = Date.now();
+        this.enhancedRefresh.runs += 1;
+        this.enhancedRefresh.lastStartedAt = startedAt;
         this.enhancedBusy = true;
         try {
         const payload = await this.request("GetEnhancedOdds");
@@ -773,11 +839,23 @@ export function browserCollectorSource() {
           currentIds.add(event.id);
         }
 
-        const detailResults = await Promise.allSettled(
-          [...currentIds].map(id =>
-            this.request("GetEventDetails", "&eventId=" + id),
-          ),
+        const detailIds = this.priorityEventIdsConfigured
+          ? [...currentIds].filter(id => this.priorityEventIds.has(id))
+          : [...currentIds];
+        const detailRun = await this.runWithConcurrency(
+          detailIds,
+          options.enhancedDetailConcurrency,
+          id => this.request("GetEventDetails", "&eventId=" + id),
+          () => this.liveBusy || this.livePriorityPending,
         );
+        const detailResults = detailRun.results;
+        this.enhancedRefresh.detailRequests += detailResults.length;
+        this.enhancedRefresh.detailSuccesses += detailResults.filter(
+          result => result.status === "fulfilled",
+        ).length;
+        this.enhancedRefresh.detailFailures += detailResults.filter(
+          result => result.status === "rejected",
+        ).length;
         for (const result of detailResults) {
           if (result.status !== "fulfilled") continue;
           const details = result.value;
@@ -808,8 +886,26 @@ export function browserCollectorSource() {
           });
         }
         this.enhancedEventIds = currentIds;
-        this.lastEnhancedRefreshAt = Date.now();
-        return { enhancedEvents: currentIds.size };
+        const completedAt = Date.now();
+        // The enhanced source payload is fresh even when detail fan-out pauses
+        // for a due live refresh. Event-level timestamps still fail closed
+        // independently if their detail odds were not refreshed.
+        this.lastEnhancedRefreshAt = completedAt;
+        this.enhancedRefresh.successes += 1;
+        this.enhancedRefresh.lastCompletedAt = completedAt;
+        this.enhancedRefresh.lastDurationMs = completedAt - startedAt;
+        this.enhancedRefresh.lastError = null;
+        return {
+          enhancedEvents: currentIds.size,
+          detailRequests: detailResults.length,
+          detailPausedForLive: detailRun.paused,
+        };
+        } catch (error) {
+          this.enhancedRefresh.failures += 1;
+          this.enhancedRefresh.lastCompletedAt = Date.now();
+          this.enhancedRefresh.lastDurationMs = Date.now() - startedAt;
+          this.enhancedRefresh.lastError = String(error?.message ?? error);
+          throw error;
         } finally {
           this.enhancedBusy = false;
         }
@@ -823,6 +919,7 @@ export function browserCollectorSource() {
           lastLiveRefreshAt: this.lastLiveRefreshAt,
           liveRefresh: { ...this.liveRefresh },
           lastEnhancedRefreshAt: this.lastEnhancedRefreshAt,
+          enhancedRefresh: { ...this.enhancedRefresh },
           lastError: this.lastError,
           catalogueEvents: this.events.size,
           liveEvents: this.liveEventIds.size,
@@ -848,7 +945,13 @@ export function browserCollectorSource() {
         this.liveTimer = setTimeout(async () => {
           this.liveTimer = null;
           if (this.stopped) return;
-          const result = await this.refreshLive();
+          this.livePriorityPending = true;
+          let result;
+          try {
+            result = await this.refreshLive();
+          } finally {
+            this.livePriorityPending = false;
+          }
           this.scheduleLiveRefresh(result.backoffMs ?? options.liveRefreshMs);
         }, delay);
       },
@@ -1111,6 +1214,13 @@ async function main() {
   const initialize = async () => {
     contextId = await cdp.waitForMainContext();
     await cdp.evaluate(browserCollectorSource(), contextId);
+    // The first enhanced refresh must not fan out to the entire catalogue.
+    // refreshMatchedEvents() installs the current watchlist IDs afterwards.
+    await cdp.evaluate(
+      "globalThis.__vegasSoccerCollector.setPriorityEventIds([])",
+      contextId,
+      false,
+    );
     const catalogue = await cdp.evaluate(browserRefreshCatalogueSource, contextId);
     await cdp.evaluate(browserRefreshLiveSource, contextId);
     await cdp.evaluate(browserRefreshEnhancedSource, contextId);
@@ -1172,6 +1282,13 @@ async function main() {
       }
       const uniqueIds = [...new Set(nextSelectedIds)];
       selectedIds = uniqueIds;
+      await cdp.evaluate(
+        "globalThis.__vegasSoccerCollector.setPriorityEventIds(" +
+          `${JSON.stringify(uniqueIds)}` +
+          ")",
+        contextId,
+        false,
+      );
       if (uniqueIds.length > 0) {
         await cdp.evaluate(
           "void globalThis.__vegasSoccerCollector.refreshEvents(" +

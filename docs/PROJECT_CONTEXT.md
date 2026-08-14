@@ -673,6 +673,7 @@ A forráskód CDP-alapértéke `9222`; a `headless_primary.ps1` induláskor mind
 | `VEGAS_LIVE_REQUEST_BUDGET_MS` | `4500` összesített live request budget |
 | `VEGAS_LIVE_FAILURE_BACKOFF_MS` | `500` |
 | `VEGAS_LIVE_FAILURE_BACKOFF_MAX_MS` | `5000` |
+| `VEGAS_ENHANCED_DETAIL_CONCURRENCY` | `12` |
 | `VEGAS_MATCHED_REQUEST_TIMEOUT_MS` | `8000` |
 | `VEGAS_MATCHED_REQUEST_RETRIES` | `1` |
 | `VEGAS_MATCHED_RETRY_DELAY_MS` | `250` |
@@ -741,7 +742,9 @@ Implemented since the previous audit:
   retry, `VEGAS_LIVE_REQUEST_BUDGET_MS=4500`) and a separate 8-second
   targeted-event timeout. Live refreshes are non-overlapping and use bounded
   failure backoff. The snapshot exposes live attempt/success/failure/timeout
-  telemetry. Direct Vegas targeted refreshes run in the background, so a
+  telemetry. Enhanced detail requests are concurrency-limited and pause when
+  a live refresh is due; after initialization they prioritize the current
+  watchlist IDs. Direct Vegas targeted refreshes run in the background, so a
   `GetEventsById` timeout cannot stop the one-second snapshot heartbeat;
   successful batches are retained when another batch fails.
 - `start_all_direct_shadow_test.ps1` and

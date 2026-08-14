@@ -104,6 +104,9 @@ async function main() {
   process.once("SIGTERM", stop);
   try {
     collector = startSharedCollector();
+    // Keep the initial enhanced refresh bounded. The matched watchlist below
+    // supplies the actual priority IDs once the catalogue is available.
+    collector.setPriorityEventIds([]);
     const startedAt = Date.now();
     let initializationAttempt = 0;
     while (!stopping && !collector.lastCatalogueRefreshAt) {
@@ -131,6 +134,7 @@ async function main() {
               selectedIds = [...new Set((watchlist.events ?? []).map(event =>
                 findVegasEvent(event, timeCandidates(index, event.startTime))?.id,
               ).filter(Number.isFinite))];
+              collector.setPriorityEventIds(selectedIds);
               const result = selectedIds.length
                 ? await collector.refreshEvents(selectedIds)
                 : { failedBatches: 0 };

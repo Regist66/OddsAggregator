@@ -252,17 +252,29 @@ export function sideHealth(side, policy, now = Date.now()) {
     sourceHealth.lastFrameAgeMs = frame.ageMs;
   } else if (provider === "vegas") {
     const live = freshness(reasons, safeDocument, "lastLiveRefreshAt", policy.vegasLiveMaxAgeMs, now);
+    const enhancedReasons = new Set();
     const enhanced = freshness(
-      reasons,
+      enhancedReasons,
       safeDocument,
       "lastEnhancedRefreshAt",
       policy.vegasEnhancedMaxAgeMs,
       now,
     );
+    const enhancedRefresh = safeDocument.enhancedRefresh;
+    const enhancedNotApplicable =
+      Number(safeDocument.enhancedEvents) === 0 &&
+      enhancedRefresh &&
+      typeof enhancedRefresh === "object" &&
+      !Array.isArray(enhancedRefresh) &&
+      Number(enhancedRefresh.failures) === 0;
+    if (!enhancedNotApplicable) {
+      for (const reason of enhancedReasons) reasons.add(reason);
+    }
     sourceHealth.lastLiveRefreshAt = live.value;
     sourceHealth.lastLiveAgeMs = live.ageMs;
     sourceHealth.lastEnhancedRefreshAt = enhanced.value;
     sourceHealth.lastEnhancedAgeMs = enhanced.ageMs;
+    sourceHealth.enhancedApplicable = !enhancedNotApplicable;
     const liveRefresh = safeDocument.liveRefresh;
     sourceHealth.liveRefresh = liveRefresh && typeof liveRefresh === "object"
       && !Array.isArray(liveRefresh)
@@ -279,6 +291,22 @@ export function sideHealth(side, policy, now = Date.now()) {
           : null,
         lastError: liveRefresh.lastError ?? null,
         backoffMs: Number(liveRefresh.backoffMs) || 0,
+      }
+      : null;
+    sourceHealth.enhancedRefresh = enhancedRefresh && typeof enhancedRefresh === "object"
+      && !Array.isArray(enhancedRefresh)
+      ? {
+        runs: Number(enhancedRefresh.runs) || 0,
+        successes: Number(enhancedRefresh.successes) || 0,
+        failures: Number(enhancedRefresh.failures) || 0,
+        detailRequests: Number(enhancedRefresh.detailRequests) || 0,
+        detailSuccesses: Number(enhancedRefresh.detailSuccesses) || 0,
+        detailFailures: Number(enhancedRefresh.detailFailures) || 0,
+        pausedForLive: Number(enhancedRefresh.pausedForLive) || 0,
+        lastDurationMs: Number.isFinite(Number(enhancedRefresh.lastDurationMs))
+          ? Number(enhancedRefresh.lastDurationMs)
+          : null,
+        lastError: enhancedRefresh.lastError ?? null,
       }
       : null;
   }

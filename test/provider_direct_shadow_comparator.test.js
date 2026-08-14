@@ -131,6 +131,18 @@ test("Vegas health gate validates provider freshness and is null-safe", () => {
   assert.equal(eventId({ id: 0 }), "0");
 });
 
+test("Vegas health gate does not require enhanced freshness when no enhanced events exist", () => {
+  const health = sideHealth(side(vegasSnapshot({
+    enhancedEvents: 0,
+    lastEnhancedRefreshAt: NOW - 30_000,
+    enhancedRefresh: { failures: 0 },
+  })), policy("vegas"), NOW);
+
+  assert.equal(health.healthy, true);
+  assert.equal(health.enhancedApplicable, false);
+  assert.ok(!health.unhealthyReasons.includes("last-enhanced-refresh-at-stale"));
+});
+
 test("content comparison counts odds, status, in-play and start-time agreement", () => {
   const normal = vegasSnapshot({
     events: [
