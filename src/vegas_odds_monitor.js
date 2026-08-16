@@ -46,6 +46,14 @@ const CONFIG = {
     integer: true,
     min: 250,
   }),
+  // Direct and headless collectors can share the same provider/VPN path. A
+  // small direct-only initial offset avoids synchronized first requests while
+  // keeping the steady-state refresh cadence unchanged.
+  liveInitialDelayMs: envNumber("VEGAS_LIVE_INITIAL_DELAY_MS", 0, {
+    integer: true,
+    min: 0,
+    max: 120_000,
+  }),
   // Keep the live request comfortably below the comparator's 5s freshness
   // gate, leaving room for response parsing and atomic snapshot publication.
   // The generic request timeout remains longer for catalogue/detail calls.
@@ -71,15 +79,25 @@ const CONFIG = {
     min: 100,
     max: 120_000,
   }),
-  liveFailureBackoffMs: envNumber("VEGAS_LIVE_FAILURE_BACKOFF_MS", 500, {
+  liveFailureBackoffMs: envNumber("VEGAS_LIVE_FAILURE_BACKOFF_MS", 1_000, {
     integer: true,
     min: 0,
     max: 60_000,
   }),
-  liveFailureBackoffMaxMs: envNumber("VEGAS_LIVE_FAILURE_BACKOFF_MAX_MS", 5_000, {
+  liveFailureBackoffMaxMs: envNumber("VEGAS_LIVE_FAILURE_BACKOFF_MAX_MS", 10_000, {
     integer: true,
     min: 0,
     max: 120_000,
+  }),
+  liveLatencySampleSize: envNumber("VEGAS_LIVE_LATENCY_SAMPLE_SIZE", 600, {
+    integer: true,
+    min: 20,
+    max: 4_096,
+  }),
+  requestPhaseSampleSize: envNumber("VEGAS_REQUEST_PHASE_SAMPLE_SIZE", 120, {
+    integer: true,
+    min: 20,
+    max: 1_024,
   }),
   enhancedDetailConcurrency: envNumber("VEGAS_ENHANCED_DETAIL_CONCURRENCY", 12, {
     integer: true,
@@ -149,6 +167,8 @@ function createMonitorDiagnostics() {
     output: {
       cycles: 0,
       errors: 0,
+      skippedWriting: 0,
+      skippedInitialization: 0,
     },
     lastErrorAt: null,
     lastError: null,
@@ -339,6 +359,7 @@ async function findVegasTarget() {
 export function browserCollectorSource() {
   const options = JSON.stringify({
     liveRefreshMs: CONFIG.liveRefreshMs,
+    liveInitialDelayMs: CONFIG.liveInitialDelayMs,
     catalogueRefreshMs: CONFIG.catalogueRefreshMs,
     enhancedRefreshMs: CONFIG.matchedRefreshMs,
     requestTimeoutMs: CONFIG.requestTimeoutMs,
@@ -348,6 +369,8 @@ export function browserCollectorSource() {
     liveRequestBudgetMs: CONFIG.liveRequestBudgetMs,
     liveFailureBackoffMs: CONFIG.liveFailureBackoffMs,
     liveFailureBackoffMaxMs: CONFIG.liveFailureBackoffMaxMs,
+    liveLatencySampleSize: CONFIG.liveLatencySampleSize,
+    requestPhaseSampleSize: CONFIG.requestPhaseSampleSize,
     enhancedDetailConcurrency: CONFIG.enhancedDetailConcurrency,
     matchedRequestTimeoutMs: CONFIG.matchedRequestTimeoutMs,
     matchedRequestRetries: CONFIG.matchedRequestRetries,
@@ -379,6 +402,8 @@ export function browserCollectorSource() {
       enhancedBusy: false,
       matchedEventsBusy: false,
       stopped: false,
+      liveLatencySamples: [],
+      requestPhaseSamples: [],
       liveTimer: null,
       liveRefresh: {
         attempts: 0,
@@ -396,6 +421,16 @@ export function browserCollectorSource() {
         lastError: null,
         backoffMs: 0,
         nextAttemptAt: null,
+        latencySamples: 0,
+        latencyWindowSize: options.liveLatencySampleSize,
+        latencyP50Ms: null,
+        latencyP95Ms: null,
+        latencyP99Ms: null,
+        latencyMaxMs: null,
+        requestPhaseSamples: 0,
+        requestPhaseWindowSize: options.requestPhaseSampleSize,
+        lastRequestPhases: null,
+        requestPhaseP95Ms: null,
       },
       enhancedRefresh: {
         runs: 0,
@@ -424,6 +459,60 @@ export function browserCollectorSource() {
         );
       },
 
+      recordLiveLatency(durationMs) {
+        const numeric = Number(durationMs);
+        if (!Number.isFinite(numeric) || numeric < 0) return;
+        this.liveLatencySamples ??= [];
+        this.liveLatencySamples.push(numeric);
+        if (this.liveLatencySamples.length > options.liveLatencySampleSize) {
+          this.liveLatencySamples.splice(
+            0,
+            this.liveLatencySamples.length - options.liveLatencySampleSize,
+          );
+        }
+        const sorted = [...this.liveLatencySamples].sort((left, right) => left - right);
+        const percentile = ratio => sorted[
+          Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * ratio) - 1))
+        ];
+        this.liveRefresh.latencySamples = sorted.length;
+        this.liveRefresh.latencyWindowSize = options.liveLatencySampleSize;
+        this.liveRefresh.latencyP50Ms = percentile(0.50);
+        this.liveRefresh.latencyP95Ms = percentile(0.95);
+        this.liveRefresh.latencyP99Ms = percentile(0.99);
+        this.liveRefresh.latencyMaxMs = sorted[sorted.length - 1];
+      },
+
+      recordRequestPhases(phases) {
+        if (!phases || typeof phases !== "object" || Array.isArray(phases)) return;
+        const fields = ["dnsMs", "tcpMs", "tlsMs", "ttfbMs", "bodyMs", "totalMs"];
+        const normalized = Object.fromEntries(fields.map(field => {
+          const value = Number(phases[field]);
+          return [field, Number.isFinite(value) && value >= 0 ? value : null];
+        }));
+        this.requestPhaseSamples ??= [];
+        this.requestPhaseSamples.push(normalized);
+        if (this.requestPhaseSamples.length > options.requestPhaseSampleSize) {
+          this.requestPhaseSamples.splice(
+            0,
+            this.requestPhaseSamples.length - options.requestPhaseSampleSize,
+          );
+        }
+        const percentile = field => {
+          const values = this.requestPhaseSamples
+            .map(item => item[field])
+            .filter(value => Number.isFinite(value))
+            .sort((left, right) => left - right);
+          if (values.length === 0) return null;
+          return values[Math.min(values.length - 1, Math.ceil(values.length * 0.95) - 1)];
+        };
+        this.liveRefresh.requestPhaseSamples = this.requestPhaseSamples.length;
+        this.liveRefresh.requestPhaseWindowSize = options.requestPhaseSampleSize;
+        this.liveRefresh.lastRequestPhases = normalized;
+        this.liveRefresh.requestPhaseP95Ms = Object.fromEntries(
+          fields.map(field => [field, percentile(field)]),
+        );
+      },
+
       setPriorityEventIds(eventIds) {
         this.priorityEventIdsConfigured = true;
         this.priorityEventIds = new Set(
@@ -431,11 +520,25 @@ export function browserCollectorSource() {
         );
       },
 
-      async request(endpoint, parameters = "", timeoutMs = options.requestTimeoutMs) {
+      async request(
+        endpoint,
+        parameters = "",
+        timeoutMs = options.requestTimeoutMs,
+        requestOptions = {},
+      ) {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), timeoutMs);
         try {
-          const response = await fetch(BASE + endpoint + this.query() + parameters, {
+          const url = BASE + endpoint + this.query() + parameters;
+          const nodeTransport = globalThis.__vegasNodeRequestTransport;
+          if (typeof nodeTransport === "function") {
+            const result = await nodeTransport(url, timeoutMs);
+            requestOptions.onRequestPhases?.(result?.phases);
+            if (result?.timedOut) throw new Error(endpoint + " kérés időtúllépés");
+            if (!result?.ok) throw new Error(endpoint + " HTTP " + result?.status);
+            return JSON.parse(result.body ?? "");
+          }
+          const response = await fetch(url, {
             cache: "no-store",
             signal: controller.signal,
           });
@@ -472,10 +575,11 @@ export function browserCollectorSource() {
               endpoint,
               parameters,
               Math.max(1, Math.min(timeoutMs, remainingMs)),
+              requestOptions,
             );
           } catch (error) {
             lastError = error;
-            if (attempt >= retries) break;
+            if (attempt >= retries || requestOptions.shouldRetry?.(error) === false) break;
             requestOptions.onRetry?.({ attempt: attempt + 1, error });
             const availableForDelay = deadline === null
               ? retryDelayMs
@@ -679,6 +783,13 @@ export function browserCollectorSource() {
             options.liveRetryDelayMs,
             {
               totalTimeoutMs: options.liveRequestBudgetMs,
+              // A timeout already consumed the request budget. Retrying it
+              // immediately amplifies provider/VPN congestion; the next
+              // scheduled refresh and bounded failure backoff provide recovery.
+              shouldRetry: error => !/idő?túllépés|timeout|abort/i.test(
+                String(error?.message ?? error),
+              ),
+              onRequestPhases: phases => this.recordRequestPhases(phases),
               onRetry: () => { this.liveRefresh.retries += 1; },
             },
           );
@@ -698,6 +809,7 @@ export function browserCollectorSource() {
           this.liveRefresh.lastError = null;
           this.liveRefresh.backoffMs = 0;
           this.liveRefresh.nextAttemptAt = completedAt + options.liveRefreshMs;
+          this.recordLiveLatency(completedAt - startedAt);
           return {
             ok: true,
             events: currentIds.size,
@@ -720,6 +832,7 @@ export function browserCollectorSource() {
           );
           this.liveRefresh.nextAttemptAt = completedAt + this.liveRefresh.backoffMs;
           this.lastError = error.message;
+          this.recordLiveLatency(completedAt - startedAt);
           return {
             ok: false,
             error: message,
@@ -973,7 +1086,9 @@ export function browserCollectorSource() {
         options.catalogueRefreshMs,
       ),
     );
-    collector.scheduleLiveRefresh(options.liveRefreshMs);
+    collector.scheduleLiveRefresh(
+      options.liveInitialDelayMs > 0 ? options.liveInitialDelayMs : options.liveRefreshMs,
+    );
     return true;
   })()`;
 }
@@ -1309,7 +1424,15 @@ async function main() {
   };
 
   const writeOutput = async () => {
-    if (writing || stopping || refreshingMatchedEvents || initializationPromise) return;
+    if (stopping) return;
+    if (initializationPromise) {
+      incrementDiagnostic(diagnostics, "output", "skippedInitialization");
+      return;
+    }
+    if (writing) {
+      incrementDiagnostic(diagnostics, "output", "skippedWriting");
+      return;
+    }
     writing = true;
     incrementDiagnostic(diagnostics, "output", "cycles");
     try {

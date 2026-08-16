@@ -1117,6 +1117,16 @@ class DirectCollector {
       + diagnosticCounts["not-renderable"]
       + selectedClosedMarkets;
     const subscribedAccountingMatches = markets.length + missingOutputMarkets === this.selectedMarketIds.size;
+    const blockingMissingMarkets = diagnosticCounts["not-ready"]
+      + diagnosticCounts.stale
+      + selectedClosedMarkets;
+    const catalogueAccountedMarkets = markets.length + missingOutputMarkets;
+    const renderableCoverageRatio = this.selectedMarketIds.size > 0
+      ? markets.length / this.selectedMarketIds.size
+      : null;
+    const catalogueCoverageRatio = subscribedAccountingMatches && this.selectedMarketIds.size > 0
+      ? catalogueAccountedMarkets / this.selectedMarketIds.size
+      : null;
     const detailLimit = Math.max(0, CONFIG.diagnosticDetailLimit);
     const limitedDetails = Object.fromEntries(Object.entries(details).map(([reason, entries]) => [reason, entries.slice(0, detailLimit)]));
     const openConnections = this.connections.filter(connection => connection.socket?.readyState === WebSocket.OPEN).length;
@@ -1135,6 +1145,16 @@ class DirectCollector {
         counts: diagnosticCounts,
         detailLimit,
         details: limitedDetails,
+      },
+      coverage: {
+        subscribedMarkets: this.selectedMarketIds.size,
+        initializedMarkets: markets.length,
+        renderableCoverageRatio,
+        catalogueCoverageRatio,
+        notRenderableMarkets: diagnosticCounts["not-renderable"],
+        blockingMissingMarkets,
+        catalogueAccountedMarkets,
+        subscribedAccountingMatches,
       },
       socketConnections: this.connections.length, openSocketConnections: openConnections,
       marketSocketOwners: this.marketConnections.size,

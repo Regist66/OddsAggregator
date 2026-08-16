@@ -123,6 +123,15 @@ watchlistet a direct SharpX snapshotból építi, így a három collector
 forrásoldalon Chrome nélkül fut; kanonikus combined/surebet kimenetet továbbra
 sem ír.
 
+A provider comparator rövid stale tüskékre 3 másodperces hysteresis-grace-t
+használ, miközben a nyers és az elnyomott mintákat külön telemetrizálja. A két
+snapshotot legfeljebb három gyors újraolvasással párosítja, ha a
+`generatedAt`-különbség meghaladja az 5 másodpercet. A fő kapcsolók:
+`--stale-grace-ms`, `--paired-snapshot-attempts` és
+`--paired-snapshot-retry-ms`. Live eseménytartalmi egyezést csak azonos
+fázisban és legfeljebb 3 másodperces `updatedAt`-eltéréssel számolunk;
+ez a `--event-update-max-skew-ms` kapcsolóval állítható.
+
 Induláskor a launcher legfeljebb 60 másodpercig vár mindhárom friss, olvasható
 JSON-ra. Startup hiba esetén csak az adott GUID-os run PID-jeit és konténereit
 takarítja; a `logs\all-direct-shadow\<runId>\run-manifest.json` tartalmazza a
@@ -166,7 +175,12 @@ A 15 perces futás lejárta után az eredmények a
 ```
 
 A `direct_primary_health.json` forrásonként mutatja a frissességet és a
-fail-closed állapotot. A headless production stack változatlanul a
+fail-closed állapotot. A SharpX direct coverage külön jelzi a renderelhető
+piacok arányát és a katalógussal elszámolt piacok arányát; a pusztán
+végrehajtható lay-ár nélküli (`not-renderable`) piac nem blokkolja az outputot.
+Átmeneti `not-ready`/accounting eltérés mellett az output akkor marad aktív,
+ha a renderelhető coverage legalább 90%; ilyenkor a health állapot
+`fresh-degraded`. A 90% alatti coverage továbbra is fail-closed. A headless production stack változatlanul a
 `infra/docker/compose.yml` fájllal kezelhető, ezért a direct smoke nem írja felül
 annak kanonikus kimeneteit.
 
@@ -521,11 +535,14 @@ A leggyakrabban használt felülírások:
 | `TIPPMIXPRO_OUTPUT_INTERVAL_MS` | `1000` |
 | `VEGAS_OUTPUT_INTERVAL_MS` | `1000` |
 | `VEGAS_LIVE_REFRESH_MS` | `1000` |
+| `VEGAS_LIVE_INITIAL_DELAY_MS` | `0`; direct stack alapértelmezésben `500` ms offset |
 | `VEGAS_LIVE_REQUEST_RETRIES` | `1` |
 | `VEGAS_LIVE_RETRY_DELAY_MS` | `150` |
 | `VEGAS_LIVE_REQUEST_BUDGET_MS` | `4500` összesített live request budget |
-| `VEGAS_LIVE_FAILURE_BACKOFF_MS` | `500` |
-| `VEGAS_LIVE_FAILURE_BACKOFF_MAX_MS` | `5000` |
+| `VEGAS_LIVE_FAILURE_BACKOFF_MS` | `1000`; timeout után exponenciális backoff |
+| `VEGAS_LIVE_FAILURE_BACKOFF_MAX_MS` | `10000` |
+| `VEGAS_LIVE_LATENCY_SAMPLE_SIZE` | `600` gördülő live latency minta |
+| `VEGAS_REQUEST_PHASE_SAMPLE_SIZE` | `120` direct DNS/TCP/TLS/TTFB/body fázisminta |
 | `VEGAS_ENHANCED_DETAIL_CONCURRENCY` | `12` |
 | `VEGAS_MATCHED_REFRESH_MS` | `5000` |
 | `VEGAS_MATCHED_REQUEST_TIMEOUT_MS` | `8000` |

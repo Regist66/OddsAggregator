@@ -7,10 +7,13 @@ import test from "node:test";
 import {
   compareSnapshots,
   createStats,
+  createHealthHysteresis,
   eventId,
   main,
+  readPairedSnapshots,
   recordSample,
   sideHealth,
+  stabilizeHealthReasons,
   summarizedStats,
 } from "../src/provider_direct_shadow_comparator.js";
 
@@ -143,6 +146,73 @@ test("Vegas health gate does not require enhanced freshness when no enhanced eve
   assert.ok(!health.unhealthyReasons.includes("last-enhanced-refresh-at-stale"));
 });
 
+test("comparator hysteresis suppresses short transient freshness gaps", () => {
+  const state = createHealthHysteresis();
+  const reasons = ["normal-last-live-refresh-at-stale", "snapshot-skew-high"];
+
+  assert.deepEqual(
+    stabilizeHealthReasons(reasons, state, 1_000, 3_000),
+    {
+      reasons: [],
+      suppressedReasons: reasons,
+      transientAgeMs: 0,
+    },
+  );
+  assert.deepEqual(
+    stabilizeHealthReasons(reasons, state, 2_500, 3_000),
+    {
+      reasons: [],
+      suppressedReasons: reasons,
+      transientAgeMs: 1_500,
+    },
+  );
+  assert.deepEqual(
+    stabilizeHealthReasons(reasons, state, 4_001, 3_000),
+    {
+      reasons,
+      suppressedReasons: [],
+      transientAgeMs: 3_001,
+    },
+  );
+  assert.deepEqual(
+    stabilizeHealthReasons([], state, 4_100, 3_000),
+    { reasons: [], suppressedReasons: [], transientAgeMs: 0 },
+  );
+  assert.equal(state.rawInvalidSamples, 3);
+  assert.equal(state.suppressedInvalidSamples, 2);
+});
+
+test("paired snapshot sampling retries and resolves generatedAt skew", async () => {
+  let normalReads = 0;
+  let directReads = 0;
+  const result = await readPairedSnapshots(
+    "normal.json",
+    "direct.json",
+    100,
+    3,
+    0,
+    async file => {
+      const isNormal = file === "normal.json";
+      const readNumber = isNormal ? normalReads++ : directReads++;
+      return {
+        ok: true,
+        fileAgeMs: 0,
+        document: {
+          generatedAt: readNumber === 0
+            ? (isNormal ? NOW : NOW - 1_000)
+            : NOW,
+        },
+      };
+    },
+  );
+
+  assert.equal(result.attempts, 2);
+  assert.equal(result.retries, 1);
+  assert.equal(result.initialSnapshotSkewMs, 1_000);
+  assert.equal(result.snapshotSkewMs, 0);
+  assert.equal(result.skewResolved, true);
+});
+
 test("content comparison counts odds, status, in-play and start-time agreement", () => {
   const normal = vegasSnapshot({
     events: [
@@ -162,16 +232,48 @@ test("content comparison counts odds, status, in-play and start-time agreement",
   const comparison = compareSnapshots(normal, direct, "vegas");
 
   assert.equal(comparison.commonEvents, 2);
+  assert.equal(comparison.coherentEvents, 1);
   assert.equal(comparison.normalOnly, 1);
   assert.equal(comparison.directOnly, 1);
+  assert.deepEqual(comparison.eventCoherence, {
+    comparedEvents: 1,
+    skippedEvents: 1,
+    phaseMismatches: 1,
+    liveUpdateTimestampMissing: 0,
+    liveUpdateSkew: 0,
+  });
   for (const field of ["odds", "status", "inPlay", "startTime", "allFields"]) {
     assert.deepEqual(comparison.fields[field], {
-      compared: 2,
+      compared: 1,
       agreements: 1,
-      mismatches: 1,
-      agreementRatio: 0.5,
+      mismatches: 0,
+      agreementRatio: 1,
     });
   }
+});
+
+test("Vegas comparison skips live events with incoherent update timestamps", () => {
+  const normal = vegasSnapshot({
+    events: [vegasEvent({ id: 1, live: true, updatedAt: NOW - 100 })],
+  });
+  const direct = vegasSnapshot({
+    events: [vegasEvent({ id: 1, live: true, updatedAt: NOW - 5_000 })],
+  });
+
+  const comparison = compareSnapshots(normal, direct, "vegas", {
+    eventUpdateMaxSkewMs: 1_000,
+  });
+
+  assert.equal(comparison.commonEvents, 1);
+  assert.equal(comparison.coherentEvents, 0);
+  assert.equal(comparison.fields.allFields.compared, 0);
+  assert.deepEqual(comparison.eventCoherence, {
+    comparedEvents: 0,
+    skippedEvents: 1,
+    phaseMismatches: 0,
+    liveUpdateTimestampMissing: 0,
+    liveUpdateSkew: 1,
+  });
 });
 
 test("warmup and invalid samples cannot change coverage maxima or content totals", () => {
@@ -189,20 +291,27 @@ test("warmup and invalid samples cannot change coverage maxima or content totals
 
   recordSample(stats, { warmup: true, sampleValid: false, invalidReasons: ["warmup"], comparison: largeDiff });
   recordSample(stats, { warmup: false, sampleValid: false, invalidReasons: ["direct-content-stale"], comparison: largeDiff });
+  recordSample(stats, {
+    warmup: false,
+    sampleValid: true,
+    comparisonSkipped: true,
+    comparison: largeDiff,
+  });
   recordSample(stats, { warmup: false, sampleValid: true, comparison: validDiff });
 
   const summary = summarizedStats(stats);
-  assert.equal(summary.samples, 3);
+  assert.equal(summary.samples, 4);
   assert.equal(summary.warmupSamples, 1);
-  assert.equal(summary.eligibleSamples, 2);
+  assert.equal(summary.eligibleSamples, 3);
   assert.equal(summary.invalidSamples, 1);
   assert.equal(summary.staleSamples, 1);
   assert.equal(summary.validSamples, 1);
+  assert.equal(summary.graceSamples, 1);
   assert.equal(summary.normalOnlyMax, 2);
   assert.equal(summary.directOnlyMax, 1);
   assert.equal(summary.commonEventObservations, 1);
   assert.equal(summary.odds.compared, 1);
-  assert.equal(summary.readinessRatio, 0.5);
+  assert.equal(summary.readinessRatio, 2 / 3);
   assert.deepEqual(summary.invalidSamplesByReason, { "direct-content-stale": 1 });
 });
 

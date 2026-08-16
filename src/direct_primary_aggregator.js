@@ -91,6 +91,10 @@ const CONFIG = {
     integer: true,
     min: 0,
   }),
+  minimumCoverageRatio: envNumber("DIRECT_PRIMARY_MIN_COVERAGE_RATIO", 0.90, {
+    min: 0,
+    max: 1,
+  }),
   durationMs: envNumber("DIRECT_PRIMARY_DURATION_HOURS", 0, {
     min: 0,
     max: 720,
@@ -127,6 +131,69 @@ function timestampFreshness(value, now, maxAgeMs) {
   return "fresh";
 }
 
+function directSharpXCoverage(snapshot) {
+  const subscribedMarkets = Number(snapshot?.subscribedMarkets);
+  const initializedMarkets = Number(snapshot?.initializedMarkets);
+  const diagnostics = snapshot?.marketDiagnostics;
+  const counts = diagnostics?.counts;
+  const hasDiagnostics = diagnostics && typeof diagnostics === "object" && counts && typeof counts === "object";
+  const renderableCoverageRatio = Number.isInteger(subscribedMarkets) && subscribedMarkets > 0
+    && Number.isInteger(initializedMarkets)
+    ? initializedMarkets / subscribedMarkets
+    : null;
+
+  if (!hasDiagnostics) {
+    return {
+      subscribedMarkets: Number.isInteger(subscribedMarkets) ? subscribedMarkets : null,
+      initializedMarkets: Number.isInteger(initializedMarkets) ? initializedMarkets : null,
+      renderableCoverageRatio,
+      catalogueCoverageRatio: renderableCoverageRatio,
+      notRenderableMarkets: null,
+      blockingMissingMarkets: null,
+      accountingMatches: null,
+      diagnosticsAvailable: false,
+    };
+  }
+
+  const notRenderableMarkets = Number(counts["not-renderable"]);
+  const notReadyMarkets = Number(counts["not-ready"]);
+  const staleMarkets = Number(counts.stale);
+  const closedMarkets = Number(counts.closed);
+  const missingOutputMarkets = Number(diagnostics.missingOutputMarkets);
+  const accountingMatches = diagnostics.subscribedAccountingMatches === true;
+  const validDiagnosticCounts = [
+    notRenderableMarkets,
+    notReadyMarkets,
+    staleMarkets,
+    closedMarkets,
+    missingOutputMarkets,
+  ].every(value => Number.isInteger(value) && value >= 0);
+  const blockingMissingMarkets = validDiagnosticCounts
+    ? notReadyMarkets + staleMarkets + closedMarkets
+    : null;
+  const accountedMarkets = validDiagnosticCounts
+    ? initializedMarkets + notRenderableMarkets + blockingMissingMarkets
+    : null;
+  const catalogueCoverageRatio = Number.isInteger(subscribedMarkets)
+    && subscribedMarkets > 0
+    && Number.isInteger(accountedMarkets)
+    ? accountedMarkets / subscribedMarkets
+    : null;
+
+  return {
+    subscribedMarkets: Number.isInteger(subscribedMarkets) ? subscribedMarkets : null,
+    initializedMarkets: Number.isInteger(initializedMarkets) ? initializedMarkets : null,
+    renderableCoverageRatio,
+    catalogueCoverageRatio,
+    notRenderableMarkets: Number.isInteger(notRenderableMarkets) ? notRenderableMarkets : null,
+    blockingMissingMarkets,
+    accountingMatches,
+    diagnosticsAvailable: true,
+    accountedMarkets,
+    missingOutputMarkets: Number.isInteger(missingOutputMarkets) ? missingOutputMarkets : null,
+  };
+}
+
 function assessSharpXSnapshot(side, now) {
   const snapshot = side.snapshot;
   const reasons = [];
@@ -139,16 +206,34 @@ function assessSharpXSnapshot(side, now) {
   if (timestampFreshness(snapshot.generatedAt, now, CONFIG.sharpXSnapshotMaxAgeMs) !== "fresh") {
     reasons.push("snapshot-stale");
   }
-  const subscribed = Number(snapshot.subscribedMarkets);
-  const initialized = Number(snapshot.initializedMarkets);
+  const coverage = directSharpXCoverage(snapshot);
+  const subscribed = coverage.subscribedMarkets;
+  const initialized = coverage.initializedMarkets;
+  const degradedReasons = [];
   if (!Number.isInteger(subscribed) || subscribed <= 0) reasons.push("coverage-unavailable");
   else if (!Number.isInteger(initialized) || initialized < 0 || initialized > subscribed) {
     reasons.push("coverage-invalid");
-  } else if (initialized / subscribed < 0.95) {
+  } else if (coverage.diagnosticsAvailable) {
+    if (!coverage.accountingMatches || coverage.accountedMarkets !== subscribed) {
+      degradedReasons.push("coverage-accounting-invalid");
+    }
+    if (coverage.blockingMissingMarkets > 0) {
+      degradedReasons.push("coverage-incomplete");
+    }
+    if (coverage.renderableCoverageRatio < CONFIG.minimumCoverageRatio) {
+      reasons.push("coverage-low");
+    }
+  } else if (coverage.renderableCoverageRatio < CONFIG.minimumCoverageRatio) {
     reasons.push("coverage-low");
   }
-  if (reasons.length > 0) return { snapshot: null, state: reasons.join(","), reasons };
-  return { snapshot, state: "fresh", reasons };
+  if (reasons.length > 0) return { snapshot: null, state: reasons.join(","), reasons, degradedReasons, coverage };
+  return {
+    snapshot,
+    state: degradedReasons.length > 0 ? "fresh-degraded" : "fresh",
+    reasons,
+    degradedReasons,
+    coverage,
+  };
 }
 
 function emptySharpXSnapshot(now) {
@@ -172,8 +257,11 @@ function sourceSummary(side, assessment) {
     generatedAt: assessment.snapshot?.generatedAt ?? side.snapshot?.generatedAt ?? null,
     events: Array.isArray(assessment.snapshot?.events) ? assessment.snapshot.events.length : null,
     markets: Array.isArray(assessment.snapshot?.markets) ? assessment.snapshot.markets.length : null,
+    coverage: assessment.coverage ?? null,
   };
 }
+
+export { assessSharpXSnapshot, directSharpXCoverage };
 
 async function writeOutput(filename, content) {
   await writeTextAtomically(filename, content);

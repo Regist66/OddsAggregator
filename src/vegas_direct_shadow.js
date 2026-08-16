@@ -1,6 +1,14 @@
 import { promises as fs } from "node:fs";
+import dns from "node:dns";
+import https from "node:https";
 import path from "node:path";
 import process from "node:process";
+import { performance } from "node:perf_hooks";
+import {
+  brotliDecompressSync,
+  gunzipSync,
+  inflateSync,
+} from "node:zlib";
 import { fileURLToPath } from "node:url";
 import {
   browserCollectorSource,
@@ -38,6 +46,128 @@ const CONFIG = {
   durationMs: numberArgument("--duration-hours", "0", { min: 0, max: 720 }) * 3_600_000,
 };
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+const nodeHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 4 });
+
+export function createNodeRequestTransport() {
+  return (url, timeoutMs) => new Promise(resolve => {
+    const startedAt = performance.now();
+    const phases = {
+      dnsMs: null,
+      tcpMs: null,
+      tlsMs: null,
+      ttfbMs: null,
+      bodyMs: null,
+      totalMs: null,
+    };
+    let timedOut = false;
+    let settled = false;
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      phases.totalMs = Math.round(performance.now() - startedAt);
+      resolve({ ...result, phases });
+    };
+
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (error) {
+      finish({ ok: false, status: 0, body: "", error: String(error?.message ?? error) });
+      return;
+    }
+
+    const request = https.request({
+      protocol: parsed.protocol,
+      hostname: parsed.hostname,
+      port: parsed.port || 443,
+      path: `${parsed.pathname}${parsed.search}`,
+      method: "GET",
+      agent: nodeHttpsAgent,
+      headers: {
+        accept: "application/json",
+        "accept-encoding": "gzip, deflate, br",
+        "user-agent": "OddsAggregator-direct/1.0",
+      },
+      lookup(hostname, options, callback) {
+        const lookupStartedAt = performance.now();
+        const lookupOptions = {
+          family: options.family ?? 0,
+          all: options.all === true,
+        };
+        dns.lookup(hostname, lookupOptions, (error, address, family) => {
+          phases.dnsMs = Math.round(performance.now() - lookupStartedAt);
+          if (options.all === true) callback(error, address);
+          else callback(error, address, family);
+        });
+      },
+    }, response => {
+      phases.ttfbMs = Math.round(performance.now() - startedAt);
+      const chunks = [];
+      response.on("data", chunk => chunks.push(chunk));
+      response.on("error", error => finish({
+        ok: false,
+        status: response.statusCode ?? 0,
+        body: "",
+        error: String(error?.message ?? error),
+      }));
+      response.on("end", () => {
+        phases.bodyMs = Math.round(performance.now() - startedAt - (phases.ttfbMs ?? 0));
+        const compressedBody = Buffer.concat(chunks);
+        const encoding = String(response.headers["content-encoding"] ?? "").toLowerCase();
+        let body = compressedBody;
+        try {
+          if (encoding.includes("br")) body = brotliDecompressSync(compressedBody);
+          else if (encoding.includes("gzip")) body = gunzipSync(compressedBody);
+          else if (encoding.includes("deflate")) body = inflateSync(compressedBody);
+        } catch (error) {
+          finish({
+            ok: false,
+            status: response.statusCode ?? 0,
+            body: "",
+            error: String(error?.message ?? error),
+          });
+          return;
+        }
+        finish({
+          ok: (response.statusCode ?? 0) >= 200 && (response.statusCode ?? 0) < 300,
+          status: response.statusCode ?? 0,
+          body: body.toString("utf8"),
+        });
+      });
+    });
+
+    request.on("socket", socket => {
+      if (request.reusedSocket === true) {
+        // A keep-alive socket has no new DNS/TCP/TLS phases. Do not attach
+        // listeners to it again: repeated requests would otherwise accumulate
+        // listeners and produce MaxListenersExceededWarning noise.
+        phases.tcpMs = 0;
+        phases.tlsMs = 0;
+        return;
+      }
+      if (!socket.connecting) return;
+      socket.once("connect", () => {
+        phases.tcpMs ??= Math.round(performance.now() - startedAt);
+      });
+      socket.once("secureConnect", () => {
+        phases.tlsMs = Math.round(performance.now() - startedAt);
+      });
+    });
+    request.setTimeout(timeoutMs, () => {
+      timedOut = true;
+      request.destroy(new Error("Vegas direct request timeout"));
+    });
+    request.on("error", error => finish({
+      ok: false,
+      status: 0,
+      body: "",
+      timedOut,
+      error: String(error?.message ?? error),
+    }));
+    request.end();
+  });
+}
 
 async function writeAtomically(file, document) {
   await writeTextAtomically(file, `${JSON.stringify(document, null, 2)}\n`);
@@ -102,6 +232,8 @@ async function main() {
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
+  const previousNodeTransport = globalThis.__vegasNodeRequestTransport;
+  globalThis.__vegasNodeRequestTransport = createNodeRequestTransport();
   try {
     collector = startSharedCollector();
     // Keep the initial enhanced refresh bounded. The matched watchlist below
@@ -162,6 +294,11 @@ async function main() {
     }
   } finally {
     stop();
+    if (previousNodeTransport === undefined) {
+      delete globalThis.__vegasNodeRequestTransport;
+    } else {
+      globalThis.__vegasNodeRequestTransport = previousNodeTransport;
+    }
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
     await writerLock.release();

@@ -83,6 +83,47 @@ test("Vegas live refresh uses the freshness-safe timeout", async () => {
   }
 });
 
+test("Vegas direct transport records DNS, TCP, TLS, TTFB and body phases", async () => {
+  const previousTransport = globalThis.__vegasNodeRequestTransport;
+  globalThis.__vegasNodeRequestTransport = async (url, timeoutMs) => {
+    assert.match(url, /GetLiveOverview/);
+    assert.equal(timeoutMs, 3_000);
+    return {
+      ok: true,
+      status: 200,
+      body: JSON.stringify({ events: [], markets: [], odds: [], competitors: [], champs: [] }),
+      phases: {
+        dnsMs: 4,
+        tcpMs: 8,
+        tlsMs: 12,
+        ttfbMs: 30,
+        bodyMs: 6,
+        totalMs: 36,
+      },
+    };
+  };
+  new Function(`return ${browserCollectorSource()};`)();
+  const collector = globalThis.__vegasSoccerCollector;
+  try {
+    await collector.refreshLive();
+    assert.equal(collector.liveRefresh.requestPhaseSamples, 1);
+    assert.deepEqual(collector.liveRefresh.lastRequestPhases, {
+      dnsMs: 4,
+      tcpMs: 8,
+      tlsMs: 12,
+      ttfbMs: 30,
+      bodyMs: 6,
+      totalMs: 36,
+    });
+    assert.equal(collector.liveRefresh.requestPhaseP95Ms.ttfbMs, 30);
+  } finally {
+    collector.shutdown();
+    delete globalThis.__vegasSoccerCollector;
+    if (previousTransport === undefined) delete globalThis.__vegasNodeRequestTransport;
+    else globalThis.__vegasNodeRequestTransport = previousTransport;
+  }
+});
+
 test("Vegas live refresh retries a transient request failure", async () => {
   new Function(`return ${browserCollectorSource()};`)();
   const collector = globalThis.__vegasSoccerCollector;
@@ -107,7 +148,7 @@ test("Vegas live refresh retries a transient request failure", async () => {
   }
 });
 
-test("Vegas live refresh records bounded timeout failures and backoff", async () => {
+test("Vegas live refresh does not retry a timeout and applies bounded backoff", async () => {
   new Function(`return ${browserCollectorSource()};`)();
   const collector = globalThis.__vegasSoccerCollector;
   try {
@@ -120,10 +161,29 @@ test("Vegas live refresh records bounded timeout failures and backoff", async ()
     assert.equal(result.ok, false);
     assert.equal(collector.liveRefresh.failures, 1);
     assert.equal(collector.liveRefresh.timeouts, 1);
-    assert.equal(collector.liveRefresh.retries, 1);
+    assert.equal(collector.liveRefresh.retries, 0);
     assert.equal(collector.liveRefresh.consecutiveFailures, 1);
-    assert.equal(collector.liveRefresh.backoffMs, 500);
+    assert.equal(collector.liveRefresh.backoffMs, 1_000);
     assert.ok(Number.isFinite(collector.liveRefresh.nextAttemptAt));
+  } finally {
+    collector.shutdown();
+    delete globalThis.__vegasSoccerCollector;
+  }
+});
+
+test("Vegas live refresh exposes rolling latency percentiles", () => {
+  new Function(`return ${browserCollectorSource()};`)();
+  const collector = globalThis.__vegasSoccerCollector;
+  try {
+    for (const durationMs of [100, 200, 300, 400, 500]) {
+      collector.recordLiveLatency(durationMs);
+    }
+
+    assert.equal(collector.liveRefresh.latencySamples, 5);
+    assert.equal(collector.liveRefresh.latencyP50Ms, 300);
+    assert.equal(collector.liveRefresh.latencyP95Ms, 500);
+    assert.equal(collector.liveRefresh.latencyP99Ms, 500);
+    assert.equal(collector.liveRefresh.latencyMaxMs, 500);
   } finally {
     collector.shutdown();
     delete globalThis.__vegasSoccerCollector;

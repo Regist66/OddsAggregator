@@ -455,6 +455,12 @@ megadott duration állítja le őket; a collector konténerek `--rm` módban fut
   `hysteresis-retained`, `not-ready`, `not-renderable`, `stale` és `closed`
   piacokat. A direct collector a normal collectorral azonosan kizárja a nem
   `OPEN` vagy végrehajtható lay-ár nélküli piacot.
+- A direct primary health külön kezeli a renderelhető coverage-t és a
+  katalógus-lefedettséget. A `not-renderable` piacok (például végrehajtható
+  lay-ár nélkül) nem számítanak katalógushiánynak és nem blokkolják a direct
+  outputot. Átmeneti `not-ready`/accounting eltérés mellett a legalább 90%-os
+  renderelhető output `fresh-degraded` állapotban tovább publikálható; 90% alatt
+  a direct aggregator fail-closed marad.
 - A socket-tömörítéshez három egymást követő nyomásciklus és két sikeres
   tömörítés között 5 perces cooldown kell.
 
@@ -667,12 +673,15 @@ A forráskód CDP-alapértéke `9222`; a `headless_primary.ps1` induláskor mind
 | `TIPPMIXPRO_CATALOGUE_REFRESH_MS` | `300000` |
 | `VEGAS_OUTPUT_INTERVAL_MS` | `1000` |
 | `VEGAS_LIVE_REFRESH_MS` | `1000` |
+| `VEGAS_LIVE_INITIAL_DELAY_MS` | `0`; direct stack alapértelmezésben `500` ms offset |
 | `VEGAS_MATCHED_REFRESH_MS` | `5000` |
 | `VEGAS_LIVE_REQUEST_RETRIES` | `1` |
 | `VEGAS_LIVE_RETRY_DELAY_MS` | `150` |
 | `VEGAS_LIVE_REQUEST_BUDGET_MS` | `4500` összesített live request budget |
-| `VEGAS_LIVE_FAILURE_BACKOFF_MS` | `500` |
-| `VEGAS_LIVE_FAILURE_BACKOFF_MAX_MS` | `5000` |
+| `VEGAS_LIVE_FAILURE_BACKOFF_MS` | `1000`; timeout után exponenciális backoff |
+| `VEGAS_LIVE_FAILURE_BACKOFF_MAX_MS` | `10000` |
+| `VEGAS_LIVE_LATENCY_SAMPLE_SIZE` | `600` gördülő live latency minta |
+| `VEGAS_REQUEST_PHASE_SAMPLE_SIZE` | `120` direct DNS/TCP/TLS/TTFB/body fázisminta |
 | `VEGAS_ENHANCED_DETAIL_CONCURRENCY` | `12` |
 | `VEGAS_MATCHED_REQUEST_TIMEOUT_MS` | `8000` |
 | `VEGAS_MATCHED_REQUEST_RETRIES` | `1` |
@@ -738,15 +747,22 @@ Implemented since the previous audit:
   temporarily omits `startTime` or status. The snapshot exposes optional
   `snapshotConsistency.recoveredEvents`; genuinely incomplete events without a
   previous complete record still fail closed.
-- Vegas uses a bounded live retry (`VEGAS_LIVE_REQUEST_TIMEOUT_MS=3000`, one
-  retry, `VEGAS_LIVE_REQUEST_BUDGET_MS=4500`) and a separate 8-second
-  targeted-event timeout. Live refreshes are non-overlapping and use bounded
-  failure backoff. The snapshot exposes live attempt/success/failure/timeout
-  telemetry. Enhanced detail requests are concurrency-limited and pause when
-  a live refresh is due; after initialization they prioritize the current
-  watchlist IDs. Direct Vegas targeted refreshes run in the background, so a
-  `GetEventsById` timeout cannot stop the one-second snapshot heartbeat;
-  successful batches are retained when another batch fails.
+- Vegas uses a bounded live request (`VEGAS_LIVE_REQUEST_TIMEOUT_MS=3000`,
+  `VEGAS_LIVE_REQUEST_BUDGET_MS=4500`); timeout errors do not immediately
+  retry, avoiding a retry storm, and the next cycle uses exponential bounded
+  backoff. A direct collector starts with a 500 ms live-poll offset so the
+  headless and direct paths do not synchronize their first provider request.
+  Live refreshes are non-overlapping. The snapshot exposes live
+  attempt/success/failure/timeout telemetry and rolling p50/p95/p99/max latency
+  over `VEGAS_LIVE_LATENCY_SAMPLE_SIZE` samples. Enhanced detail requests are
+  concurrency-limited and pause when a live refresh is due; after
+  initialization they prioritize the current watchlist IDs. Direct Vegas
+  targeted refreshes run in the background, so a `GetEventsById` timeout
+  cannot stop the one-second snapshot heartbeat; successful batches are
+  retained when another batch fails. Provider parity only compares common
+  events in the same live/prematch phase; live events with an `updatedAt` skew
+  above `--event-update-max-skew-ms` are reported as coherence-skipped instead
+  of being counted as odds mismatches.
 - `start_all_direct_shadow_test.ps1` and
   `start_sharpx_direct_shadow_test.ps1` remain watchdogs until the shared
   deadline, then clean only their own resources and write `completedAt` and

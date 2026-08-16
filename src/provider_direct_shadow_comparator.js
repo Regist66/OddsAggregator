@@ -32,7 +32,8 @@ validateNamedArguments([
   "interval-ms", "warmup-ms", "normal-max-content-age-ms",
   "direct-max-content-age-ms", "max-snapshot-skew-ms", "catalogue-max-age-ms",
   "tippmix-frame-max-age-ms", "vegas-live-max-age-ms",
-  "vegas-enhanced-max-age-ms",
+  "vegas-enhanced-max-age-ms", "stale-grace-ms", "paired-snapshot-attempts",
+  "paired-snapshot-retry-ms", "event-update-max-skew-ms",
 ]);
 
 const configuredIntervalMs = numberArgument("interval-ms", 1000, {
@@ -54,6 +55,10 @@ const CONFIG = {
   tippmixFrameMaxAgeMs: numberArgument("tippmix-frame-max-age-ms", 15_000, { integer: true, min: 0 }),
   vegasLiveMaxAgeMs: numberArgument("vegas-live-max-age-ms", 5_000, { integer: true, min: 0 }),
   vegasEnhancedMaxAgeMs: numberArgument("vegas-enhanced-max-age-ms", 15_000, { integer: true, min: 0 }),
+  staleGraceMs: numberArgument("stale-grace-ms", 3_000, { integer: true, min: 0, max: 60_000 }),
+  pairedSnapshotAttempts: numberArgument("paired-snapshot-attempts", 3, { integer: true, min: 1, max: 10 }),
+  pairedSnapshotRetryMs: numberArgument("paired-snapshot-retry-ms", 100, { integer: true, min: 0, max: 2_000 }),
+  eventUpdateMaxSkewMs: numberArgument("event-update-max-skew-ms", 3_000, { integer: true, min: 0, max: 60_000 }),
 };
 
 const SUPPORTED_PROVIDERS = new Set(["tippmixpro", "vegas"]);
@@ -89,6 +94,14 @@ function eventStatus(provider, event) {
 function eventStartTime(event) {
   const value = Number(event?.startTime);
   return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function eventUpdatedAt(event) {
+  for (const candidate of [event?.updatedAt, event?.liveUpdatedAt, event?.updatedAtMs]) {
+    const value = timestamp(candidate);
+    if (value !== null) return value;
+  }
+  return null;
 }
 
 function eventOdds(event) {
@@ -176,6 +189,93 @@ export async function readSnapshot(file) {
       error: error.code ?? error.message,
     };
   }
+}
+
+export async function readPairedSnapshots(
+  normalFile,
+  directFile,
+  maxSnapshotSkewMs,
+  attempts = 1,
+  retryMs = 0,
+  read = readSnapshot,
+) {
+  const maximumAttempts = Math.max(1, Number(attempts) || 1);
+  let normal;
+  let direct;
+  let snapshotSkewMs = null;
+  let initialSnapshotSkewMs = null;
+
+  for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+    [normal, direct] = await Promise.all([read(normalFile), read(directFile)]);
+    const normalGeneratedAt = timestamp(normal.document?.generatedAt);
+    const directGeneratedAt = timestamp(direct.document?.generatedAt);
+    snapshotSkewMs = normalGeneratedAt && directGeneratedAt
+      ? Math.abs(normalGeneratedAt - directGeneratedAt)
+      : null;
+    if (attempt === 1) initialSnapshotSkewMs = snapshotSkewMs;
+    if (
+      snapshotSkewMs === null
+      || snapshotSkewMs <= maxSnapshotSkewMs
+      || attempt === maximumAttempts
+    ) {
+      return {
+        normal,
+        direct,
+        snapshotSkewMs,
+        initialSnapshotSkewMs,
+        attempts: attempt,
+        retries: attempt - 1,
+        skewResolved: attempt > 1
+          && initialSnapshotSkewMs !== null
+          && initialSnapshotSkewMs > maxSnapshotSkewMs
+          && snapshotSkewMs !== null
+          && snapshotSkewMs <= maxSnapshotSkewMs,
+      };
+    }
+    if (retryMs > 0) await sleep(retryMs);
+  }
+
+  return { normal, direct, snapshotSkewMs, initialSnapshotSkewMs, attempts: maximumAttempts, retries: maximumAttempts - 1, skewResolved: false };
+}
+
+const TRANSIENT_HEALTH_REASONS = new Set([
+  "generated-at-stale",
+  "file-stale",
+  "last-live-refresh-at-stale",
+  "last-enhanced-refresh-at-stale",
+  "last-frame-at-stale",
+  "snapshot-skew-high",
+]);
+
+export function createHealthHysteresis() {
+  return {
+    transientStartedAt: null,
+    rawInvalidSamples: 0,
+    suppressedInvalidSamples: 0,
+  };
+}
+
+export function stabilizeHealthReasons(reasons, state, now, graceMs) {
+  const currentReasons = [...new Set(reasons)];
+  const transientReasons = currentReasons.filter(reason => {
+    const normalized = reason.replace(/^(normal|direct)-/, "");
+    return TRANSIENT_HEALTH_REASONS.has(normalized);
+  });
+  const persistentReasons = currentReasons.filter(reason => !transientReasons.includes(reason));
+  if (currentReasons.length > 0) state.rawInvalidSamples += 1;
+
+  if (transientReasons.length > 0) {
+    if (state.transientStartedAt === null) state.transientStartedAt = now;
+    const transientAgeMs = Math.max(0, now - state.transientStartedAt);
+    if (transientAgeMs < Math.max(0, graceMs)) {
+      if (persistentReasons.length === 0) state.suppressedInvalidSamples += 1;
+      return { reasons: persistentReasons, suppressedReasons: transientReasons, transientAgeMs };
+    }
+    return { reasons: [...persistentReasons, ...transientReasons], suppressedReasons: [], transientAgeMs };
+  }
+
+  state.transientStartedAt = null;
+  return { reasons: persistentReasons, suppressedReasons: [], transientAgeMs: 0 };
 }
 
 export function sideHealth(side, policy, now = Date.now()) {
@@ -286,6 +386,24 @@ export function sideHealth(side, policy, now = Date.now()) {
         retries: Number(liveRefresh.retries) || 0,
         skippedBusy: Number(liveRefresh.skippedBusy) || 0,
         consecutiveFailures: Number(liveRefresh.consecutiveFailures) || 0,
+        latencySamples: Number(liveRefresh.latencySamples) || 0,
+        latencyWindowSize: Number(liveRefresh.latencyWindowSize) || 0,
+        latencyP50Ms: Number.isFinite(Number(liveRefresh.latencyP50Ms))
+          ? Number(liveRefresh.latencyP50Ms)
+          : null,
+        latencyP95Ms: Number.isFinite(Number(liveRefresh.latencyP95Ms))
+          ? Number(liveRefresh.latencyP95Ms)
+          : null,
+        latencyP99Ms: Number.isFinite(Number(liveRefresh.latencyP99Ms))
+          ? Number(liveRefresh.latencyP99Ms)
+          : null,
+        latencyMaxMs: Number.isFinite(Number(liveRefresh.latencyMaxMs))
+          ? Number(liveRefresh.latencyMaxMs)
+          : null,
+        requestPhaseSamples: Number(liveRefresh.requestPhaseSamples) || 0,
+        requestPhaseWindowSize: Number(liveRefresh.requestPhaseWindowSize) || 0,
+        lastRequestPhases: liveRefresh.lastRequestPhases ?? null,
+        requestPhaseP95Ms: liveRefresh.requestPhaseP95Ms ?? null,
         lastDurationMs: Number.isFinite(Number(liveRefresh.lastDurationMs))
           ? Number(liveRefresh.lastDurationMs)
           : null,
@@ -358,8 +476,16 @@ function withAgreementRatio(counts) {
   };
 }
 
-export function compareSnapshots(normalDocument, directDocument, providerValue) {
+export function compareSnapshots(
+  normalDocument,
+  directDocument,
+  providerValue,
+  options = {},
+) {
   const provider = normalizedProvider(providerValue);
+  const eventUpdateMaxSkewMs = Number.isFinite(Number(options.eventUpdateMaxSkewMs))
+    ? Number(options.eventUpdateMaxSkewMs)
+    : null;
   const normalById = eventsById(normalDocument);
   const directById = eventsById(directDocument);
   const normalIds = new Set(normalById.keys());
@@ -372,10 +498,39 @@ export function compareSnapshots(normalDocument, directDocument, providerValue) 
     startTime: fieldCounts(),
     allFields: fieldCounts(),
   };
+  const eventCoherence = {
+    comparedEvents: 0,
+    skippedEvents: 0,
+    phaseMismatches: 0,
+    liveUpdateTimestampMissing: 0,
+    liveUpdateSkew: 0,
+  };
 
   for (const id of commonIds) {
     const normal = normalById.get(id);
     const direct = directById.get(id);
+    const normalPhase = eventInPlay(provider, normal);
+    const directPhase = eventInPlay(provider, direct);
+    if (normalPhase !== directPhase) {
+      eventCoherence.skippedEvents += 1;
+      eventCoherence.phaseMismatches += 1;
+      continue;
+    }
+    if (normalPhase === true && eventUpdateMaxSkewMs !== null) {
+      const normalUpdatedAt = eventUpdatedAt(normal);
+      const directUpdatedAt = eventUpdatedAt(direct);
+      if (normalUpdatedAt === null || directUpdatedAt === null) {
+        eventCoherence.skippedEvents += 1;
+        eventCoherence.liveUpdateTimestampMissing += 1;
+        continue;
+      }
+      if (Math.abs(normalUpdatedAt - directUpdatedAt) > eventUpdateMaxSkewMs) {
+        eventCoherence.skippedEvents += 1;
+        eventCoherence.liveUpdateSkew += 1;
+        continue;
+      }
+    }
+    eventCoherence.comparedEvents += 1;
     const agreements = {
       odds: sameArray(eventOdds(normal), eventOdds(direct)),
       status: eventStatus(provider, normal) === eventStatus(provider, direct),
@@ -392,6 +547,8 @@ export function compareSnapshots(normalDocument, directDocument, providerValue) 
     commonEvents: commonIds.length,
     normalOnly: normalIds.size - commonIds.length,
     directOnly: directIds.size - commonIds.length,
+    coherentEvents: eventCoherence.comparedEvents,
+    eventCoherence,
     fields: Object.fromEntries(
       Object.entries(fields).map(([field, counts]) => [field, withAgreementRatio(counts)]),
     ),
@@ -405,9 +562,12 @@ export function createStats() {
     eligibleSamples: 0,
     readySamples: 0,
     validSamples: 0,
+    graceSamples: 0,
     invalidSamples: 0,
     // Kept for compatibility. Warmup is intentionally not counted as stale.
     staleSamples: 0,
+    rawInvalidSamples: 0,
+    suppressedInvalidSamples: 0,
     invalidEpisodeCount: 0,
     invalidEpisodeTotalMs: 0,
     invalidEpisodeMaxMs: 0,
@@ -417,11 +577,20 @@ export function createStats() {
     normalOnlyObservations: 0,
     directOnlyObservations: 0,
     commonEventObservations: 0,
+    coherentEventObservations: 0,
+    coherenceSkippedEvents: 0,
+    phaseMismatchEvents: 0,
+    liveUpdateTimestampMissingEvents: 0,
+    liveUpdateSkewEvents: 0,
     odds: fieldCounts(),
     status: fieldCounts(),
     inPlay: fieldCounts(),
     startTime: fieldCounts(),
     allFields: fieldCounts(),
+    pairedSamples: 0,
+    pairedRetries: 0,
+    pairedSkewResolved: 0,
+    pairedSkewUnresolved: 0,
     _invalidEpisodeStartedAt: null,
   };
 }
@@ -440,7 +609,14 @@ function closeInvalidEpisode(stats, at = Date.now()) {
 
 export function recordSample(
   stats,
-  { warmup, sampleValid, invalidReasons = [], comparison = null, at = Date.now() },
+  {
+    warmup,
+    sampleValid,
+    comparisonSkipped = false,
+    invalidReasons = [],
+    comparison = null,
+    at = Date.now(),
+  },
 ) {
   stats.samples += 1;
   if (warmup) {
@@ -448,7 +624,7 @@ export function recordSample(
     return;
   }
   stats.eligibleSamples += 1;
-  if (!sampleValid || !comparison) {
+  if (!sampleValid) {
     if (stats._invalidEpisodeStartedAt === null) {
       stats._invalidEpisodeStartedAt = at;
       stats.invalidEpisodeCount += 1;
@@ -461,12 +637,21 @@ export function recordSample(
 
   closeInvalidEpisode(stats, at);
   stats.readySamples += 1;
+  if (comparisonSkipped || !comparison) {
+    stats.graceSamples += 1;
+    return;
+  }
   stats.validSamples += 1;
   stats.normalOnlyMax = Math.max(stats.normalOnlyMax, comparison.normalOnly);
   stats.directOnlyMax = Math.max(stats.directOnlyMax, comparison.directOnly);
   stats.normalOnlyObservations += comparison.normalOnly;
   stats.directOnlyObservations += comparison.directOnly;
   stats.commonEventObservations += comparison.commonEvents;
+  stats.coherentEventObservations += comparison.coherentEvents ?? comparison.commonEvents;
+  stats.coherenceSkippedEvents += comparison.eventCoherence?.skippedEvents ?? 0;
+  stats.phaseMismatchEvents += comparison.eventCoherence?.phaseMismatches ?? 0;
+  stats.liveUpdateTimestampMissingEvents += comparison.eventCoherence?.liveUpdateTimestampMissing ?? 0;
+  stats.liveUpdateSkewEvents += comparison.eventCoherence?.liveUpdateSkew ?? 0;
   for (const field of ["odds", "status", "inPlay", "startTime", "allFields"]) {
     stats[field].compared += comparison.fields[field].compared;
     stats[field].agreements += comparison.fields[field].agreements;
@@ -499,12 +684,26 @@ export async function main(config = CONFIG) {
   const summaryFile = path.join(config.outputDir, "summary.json");
   const startedAt = Date.now();
   const stats = createStats();
+  const healthHysteresis = createHealthHysteresis();
+  const staleGraceMs = Number.isFinite(Number(config.staleGraceMs))
+    ? Number(config.staleGraceMs)
+    : 0;
+  const pairedSnapshotAttempts = Number.isFinite(Number(config.pairedSnapshotAttempts))
+    ? Number(config.pairedSnapshotAttempts)
+    : 1;
+  const pairedSnapshotRetryMs = Number.isFinite(Number(config.pairedSnapshotRetryMs))
+    ? Number(config.pairedSnapshotRetryMs)
+    : 0;
 
   while (Date.now() - startedAt < config.durationMs) {
-    const [normal, direct] = await Promise.all([
-      readSnapshot(config.normalFile),
-      readSnapshot(config.directFile),
-    ]);
+    const paired = await readPairedSnapshots(
+      config.normalFile,
+      config.directFile,
+      config.maxSnapshotSkewMs,
+      pairedSnapshotAttempts,
+      pairedSnapshotRetryMs,
+    );
+    const { normal, direct } = paired;
     const now = Date.now();
     const normalHealth = sideHealth(normal, {
       ...config,
@@ -515,31 +714,63 @@ export async function main(config = CONFIG) {
       maxContentAgeMs: config.directMaxContentAgeMs,
     }, now);
     const warmup = now - startedAt < config.warmupMs;
-    const invalidReasons = [];
-    if (warmup) invalidReasons.push("warmup");
-    invalidReasons.push(...normalHealth.unhealthyReasons.map(reason => `normal-${reason}`));
-    invalidReasons.push(...directHealth.unhealthyReasons.map(reason => `direct-${reason}`));
-    const snapshotSkewMs = normalHealth.generatedAt && directHealth.generatedAt
-      ? Math.abs(normalHealth.generatedAt - directHealth.generatedAt)
-      : null;
+    const rawInvalidReasons = [];
+    if (warmup) rawInvalidReasons.push("warmup");
+    rawInvalidReasons.push(...normalHealth.unhealthyReasons.map(reason => `normal-${reason}`));
+    rawInvalidReasons.push(...directHealth.unhealthyReasons.map(reason => `direct-${reason}`));
+    const snapshotSkewMs = paired.snapshotSkewMs;
     if (snapshotSkewMs !== null && snapshotSkewMs > config.maxSnapshotSkewMs) {
-      invalidReasons.push("snapshot-skew-high");
+      rawInvalidReasons.push("snapshot-skew-high");
     }
+    const stabilized = warmup
+      ? { reasons: ["warmup"], suppressedReasons: [], transientAgeMs: 0 }
+      : stabilizeHealthReasons(rawInvalidReasons, healthHysteresis, now, staleGraceMs);
+    stats.rawInvalidSamples = healthHysteresis.rawInvalidSamples;
+    stats.suppressedInvalidSamples = healthHysteresis.suppressedInvalidSamples;
+    stats.pairedSamples += 1;
+    stats.pairedRetries += paired.retries;
+    if (paired.skewResolved) stats.pairedSkewResolved += 1;
+    if (
+      paired.snapshotSkewMs !== null
+      && paired.snapshotSkewMs > config.maxSnapshotSkewMs
+    ) stats.pairedSkewUnresolved += 1;
+    const invalidReasons = stabilized.reasons;
     const sampleValid = !warmup && invalidReasons.length === 0;
-    const comparison = sampleValid
-      ? compareSnapshots(normal.document, direct.document, config.provider)
+    const comparisonSkipped = !warmup && rawInvalidReasons.length > 0;
+    const comparison = !warmup && rawInvalidReasons.length === 0 && sampleValid
+      ? compareSnapshots(
+        normal.document,
+        direct.document,
+        config.provider,
+        { eventUpdateMaxSkewMs: config.eventUpdateMaxSkewMs },
+      )
       : null;
 
-    recordSample(stats, { warmup, sampleValid, invalidReasons, comparison, at: now });
+    recordSample(
+      stats,
+      { warmup, sampleValid, comparisonSkipped, invalidReasons, comparison, at: now },
+    );
     const item = {
       at: new Date(now).toISOString(),
       provider: config.provider,
       sampleValid,
-      comparisonSkipped: !sampleValid,
+      comparisonSkipped: warmup || comparisonSkipped || comparison === null,
       warmup,
+      rawInvalidReasons,
       invalidReasons,
+      suppressedInvalidReasons: stabilized.suppressedReasons,
+      hysteresis: {
+        staleGraceMs,
+        transientAgeMs: stabilized.transientAgeMs,
+      },
       snapshotSkewMs,
       maxSnapshotSkewMs: config.maxSnapshotSkewMs,
+      pairing: {
+        attempts: paired.attempts,
+        retries: paired.retries,
+        initialSnapshotSkewMs: paired.initialSnapshotSkewMs,
+        skewResolved: paired.skewResolved,
+      },
       normal: normalHealth,
       direct: directHealth,
       comparison,
@@ -563,6 +794,10 @@ export async function main(config = CONFIG) {
     tippmixFrameMaxAgeMs: config.tippmixFrameMaxAgeMs,
     vegasLiveMaxAgeMs: config.vegasLiveMaxAgeMs,
     vegasEnhancedMaxAgeMs: config.vegasEnhancedMaxAgeMs,
+    staleGraceMs,
+    pairedSnapshotAttempts,
+    pairedSnapshotRetryMs,
+    eventUpdateMaxSkewMs: config.eventUpdateMaxSkewMs ?? null,
     ...summarizedStats(stats),
   };
   await fs.writeFile(summaryFile, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
