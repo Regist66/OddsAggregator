@@ -239,6 +239,19 @@ Tudatos, párhuzamos futtatás csak explicit engedéllyel indítható:
 ALLOW_PARALLEL_DIRECT=1 ./infra/docker/start-direct.sh 15
 ```
 
+Docker Desktop/WSL alatt a headless és direct oldalak páros, 2 órás összevetése:
+
+```bash
+./infra/docker/start-direct-headless-comparator.sh 120
+```
+
+A futtató közös VPN-en indítja a headless és direct collectort, megvárja a
+friss snapshotokat, majd Vegas/TippmixPro/SharpX comparatorokat indít. A
+futásazonosítós eredmények a `runtime/comparator/direct-headless/<runId>/`
+könyvtárba kerülnek; a közös deadline után a teszt által indított stackeket
+automatikusan leállítja, de a Docker-konténereket és a hálózatokat megőrzi a
+következő indításhoz.
+
 Docker Desktop/WSL alatt legalább 4 GiB memória és 2 vCPU javasolt ehhez a
 Chrome + három monitor + VPN kombinációhoz. A Compose nem tudja növelni a
 Docker Desktop/WSL VM memóriáját; azt a host beállításaiban kell megadni.
