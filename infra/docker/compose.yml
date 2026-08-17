@@ -38,15 +38,93 @@ services:
       - ../../runtime/data:/app/data
     environment:
       TIPPMIXPRO_CDP_ENDPOINT: http://127.0.0.1:9333
-      TIPPMIXPRO_OUTPUT_FILE: /app/data/tippmixpro_odds_snapshot.json
-      TIPPMIXPRO_SNAPSHOT_FILE: /app/data/tippmixpro_odds_snapshot.json
-      MONITOR_HEARTBEAT_FILE: /app/data/tippmixpro_odds_snapshot.json
+      TIPPMIXPRO_OUTPUT_FILE: /app/data/tippmixpro_headless_odds_snapshot.json
+      TIPPMIXPRO_SNAPSHOT_FILE: /app/data/tippmixpro_headless_odds_snapshot.json
+      MONITOR_HEARTBEAT_FILE: /app/data/tippmixpro_headless_odds_snapshot.json
       MONITOR_STALE_MS: "${MONITOR_STALE_MS:-120000}"
       MONITOR_STARTUP_GRACE_MS: "${MONITOR_STARTUP_GRACE_MS:-180000}"
       MONITOR_POLL_MS: "${MONITOR_POLL_MS:-10000}"
     command: ["node", "/usr/local/bin/monitor-supervisor.mjs", "src/tippmixpro_odds_monitor.js"]
     healthcheck:
-      test: ["CMD", "node", "/usr/local/bin/monitor-healthcheck.mjs", "/app/data/tippmixpro_odds_snapshot.json"]
+      test: ["CMD", "node", "/usr/local/bin/monitor-healthcheck.mjs", "/app/data/tippmixpro_headless_odds_snapshot.json"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+
+  tippmixpro-direct:
+    image: oddsaggregator-headless:local
+    container_name: oddsaggregator-tippmixpro-direct
+    network_mode: "container:pia-gluetun"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    working_dir: /workspace
+    volumes:
+      - ../../src:/workspace/src:ro
+      - ../../runtime/data:/workspace/runtime/data
+    environment:
+      MONITOR_HEARTBEAT_FILE: /workspace/runtime/data/tippmixpro_direct_odds_snapshot.json
+      MONITOR_STALE_MS: "${TIPPMIXPRO_DIRECT_MONITOR_STALE_MS:-120000}"
+      MONITOR_STARTUP_GRACE_MS: "${TIPPMIXPRO_DIRECT_STARTUP_GRACE_MS:-180000}"
+      MONITOR_POLL_MS: "${TIPPMIXPRO_DIRECT_MONITOR_POLL_MS:-10000}"
+      DIRECT_OUTPUT_STALE_MS: "${TIPPMIXPRO_DIRECT_OUTPUT_STALE_MS:-120000}"
+      DIRECT_OUTPUT_FUTURE_TOLERANCE_MS: "${TIPPMIXPRO_DIRECT_OUTPUT_FUTURE_TOLERANCE_MS:-5000}"
+    command:
+      - node
+      - /usr/local/bin/monitor-supervisor.mjs
+      - src/tippmixpro_direct_shadow.js
+      - --output-file
+      - /workspace/runtime/data/tippmixpro_direct_odds_snapshot.json
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - /usr/local/bin/direct-healthcheck.mjs
+        - tippmixpro
+        - /workspace/runtime/data/tippmixpro_direct_odds_snapshot.json
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+
+  tippmixpro-selector:
+    image: oddsaggregator-headless:local
+    container_name: oddsaggregator-tippmixpro-selector
+    network_mode: "none"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    working_dir: /workspace
+    depends_on:
+      tippmixpro:
+        condition: service_started
+      tippmixpro-direct:
+        condition: service_started
+    volumes:
+      - ../../src:/workspace/src:ro
+      - ../../runtime/data:/workspace/runtime/data
+    environment:
+      MONITOR_HEARTBEAT_FILE: /workspace/runtime/data/tippmixpro_odds_snapshot.json
+      MONITOR_STALE_MS: "${TIPPMIXPRO_SELECTOR_MONITOR_STALE_MS:-120000}"
+      MONITOR_STARTUP_GRACE_MS: "${TIPPMIXPRO_SELECTOR_STARTUP_GRACE_MS:-180000}"
+      MONITOR_POLL_MS: "${TIPPMIXPRO_SELECTOR_MONITOR_POLL_MS:-10000}"
+      TIPPMIXPRO_DIRECT_SNAPSHOT_FILE: /workspace/runtime/data/tippmixpro_direct_odds_snapshot.json
+      TIPPMIXPRO_HEADLESS_SNAPSHOT_FILE: /workspace/runtime/data/tippmixpro_headless_odds_snapshot.json
+      TIPPMIXPRO_CANONICAL_SNAPSHOT_FILE: /workspace/runtime/data/tippmixpro_odds_snapshot.json
+      TIPPMIXPRO_SELECTOR_HEALTH_FILE: /workspace/runtime/data/tippmixpro_production_health.json
+      TIPPMIXPRO_SELECTOR_POLL_MS: "${TIPPMIXPRO_SELECTOR_POLL_MS:-1000}"
+      TIPPMIXPRO_SELECTOR_SNAPSHOT_MAX_AGE_MS: "${TIPPMIXPRO_SELECTOR_SNAPSHOT_MAX_AGE_MS:-10000}"
+      TIPPMIXPRO_SELECTOR_SOURCE_MAX_AGE_MS: "${TIPPMIXPRO_SELECTOR_SOURCE_MAX_AGE_MS:-15000}"
+      TIPPMIXPRO_SELECTOR_FUTURE_TOLERANCE_MS: "${TIPPMIXPRO_SELECTOR_FUTURE_TOLERANCE_MS:-5000}"
+    command: ["node", "/usr/local/bin/monitor-supervisor.mjs", "src/tippmixpro_production_selector.js"]
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - /usr/local/bin/direct-healthcheck.mjs
+        - tippmixpro
+        - /workspace/runtime/data/tippmixpro_odds_snapshot.json
       interval: 30s
       timeout: 5s
       retries: 3
@@ -62,6 +140,8 @@ services:
     depends_on:
       chrome:
         condition: service_healthy
+      tippmixpro-selector:
+        condition: service_started
     volumes:
       - ../../runtime/data:/app/data
     environment:
