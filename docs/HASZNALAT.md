@@ -234,20 +234,15 @@ status snapshot `outputHealth` mezője és a Docker healthcheck ezt a tartalmi
 A direct smoke indító alapértelmezetten megtagadja a futó production stack
 melletti indulást, mert mindkettő a `pia-gluetun` network namespace-ét használná.
 
-### TippmixPro direct production routing
+### TippmixPro headless production routing
 
-Az éles `infra/docker/compose.yml` most a TippmixPro direct collectort is
-elindítja. A headless TippmixPro külön
-`runtime/data/tippmixpro_headless_odds_snapshot.json` snapshotot ír, a direct
-collector pedig a `tippmixpro_direct_odds_snapshot.json` fájlt. A
-`tippmixpro-selector` a friss és health-valid direct snapshotot választja a
-kanonikus `tippmixpro_odds_snapshot.json` elé; direct hiba vagy stale állapot
-esetén automatikusan a headless snapshotra vált vissza.
+Az éles `infra/docker/compose.yml` a TippmixPro headless collectort közvetlenül
+a kanonikus `runtime/data/tippmixpro_odds_snapshot.json` fájlba irányítja. A
+direct collector és a production selector nincs az aktív Compose-ban, ezért a
+hibás direct snapshot nem kerülhet vissza a production adatútba.
 
-Az aktuális választás és a fallback állapot a
-`runtime/data/tippmixpro_production_health.json` fájlban látható. A SharpX és a
-Vegas továbbra is a headless collectort használja; a TippmixPro direct route
-aktiválása nem módosítja a többi provider forrását.
+A direct collector továbbra is külön shadow/validációs futtatásként használható,
+de annak kimenetét nem szabad kanonikus production forrásként használni.
 Tudatos, párhuzamos futtatás csak explicit engedéllyel indítható:
 
 ```bash

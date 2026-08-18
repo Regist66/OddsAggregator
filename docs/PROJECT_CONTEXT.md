@@ -1,10 +1,9 @@
 # OddsAggregator – projektkontextus és session handoff
 
-> Utolsó érdemi frissítés: 2026-08-17. A TippmixPro production útvonal már
-> direct-primary, automatikus headless fallbackkel; SharpX és Vegas továbbra is
-> headless forrást használ. A legutóbbi Docker-ellenőrzéskor a production stack
-> le volt állítva, ezért új session elején a Docker Engine-t, a Compose állapotot,
-> a `pia-gluetun` health-et és a friss kimeneteket mindig újra ellenőrizni kell.
+> Utolsó érdemi frissítés: 2026-08-17. A TippmixPro direct production routingot
+> visszavontuk hibás odds miatt; a production útvonal ismét közvetlen headless
+> primary. SharpX és Vegas továbbra is headless forrást használ. A direct
+> collector és selector csak külön validációs eszközként marad meg.
 
 ## Korábbi handoff röviden – 2026-08-11 (történeti)
 
@@ -27,45 +26,32 @@ Dockerben a host oldali kanonikus volume-ok tényleges helye jelenleg
 `data/` néven hivatkoznak rá. Új Dockeres ellenőrzésnél mindig az aktuális
 `infra/docker/compose.yml` volume mappingje az elsődleges.
 
-## Aktuális handoff – TippmixPro direct production routing (2026-08-17)
+## Aktuális handoff – TippmixPro headless production routing (2026-08-17)
 
 ### Jelenlegi döntés és architektúra
 
-A `infra/docker/compose.yml` production composition most négy TippmixPro
-szerepkört kezel:
+A `infra/docker/compose.yml` production composition TippmixPro esetén két
+releváns szerepet kezel:
 
 - `oddsaggregator-tippmixpro`: headless collector, amely a
-  `runtime/data/tippmixpro_headless_odds_snapshot.json` fájlba ír;
-- `oddsaggregator-tippmixpro-direct`: PIA/gluetun hálózati névtérben futó direct
-  collector, amely a `runtime/data/tippmixpro_direct_odds_snapshot.json` fájlt
-  írja;
-- `oddsaggregator-tippmixpro-selector`: hálózat nélküli selector, amely friss és
-  health-valid direct snapshot esetén a directet választja, direct stale vagy
-  disconnected állapotban pedig headless fallbackre vált;
-- `oddsaggregator-sharpx`: a selector által előállított kanonikus
-  `runtime/data/tippmixpro_odds_snapshot.json` fájlt olvassa.
+  `runtime/data/tippmixpro_odds_snapshot.json` kanonikus fájlba ír;
+- `oddsaggregator-sharpx`: ezt a kanonikus TippmixPro snapshotot olvassa.
 
-A selector állapotfájlja:
-`runtime/data/tippmixpro_production_health.json`. A kanonikus TippmixPro
-snapshot `productionSource` és `productionSourceState` mezői rögzítik, hogy
-direct vagy headless-fallback szolgáltatta-e az adatot. Vegas és SharpX
-továbbra is headless/CDP forrást használ; a TippmixPro direct átállítása nem
-váltotta át őket.
+A direct collector és a production selector nincs az aktív production
+Compose-ban. A korábbi direct kimenetek a `runtime/direct-primary/` és
+`runtime/data/tippmixpro_direct_odds_snapshot.json` alatt csak diagnosztikai
+artefaktumok; nem szabad őket kanonikus adatforrásként használni.
 
 ### Legutóbbi üzemi megfigyelés
 
 A legutóbbi futó állapotellenőrzésben minden production- és infrastruktúra-
 container `healthy` volt, restart számlálójuk `0`:
 
-- TippmixPro direct és selector: `running/healthy`, production source:
-  `direct`, state: `fresh`;
-- headless TippmixPro fallback: `healthy`, state: `fresh`;
-- canonical snapshot: `connected=true`, `pendingWork=0`, hiba nélkül;
-- az ellenőrzéskor a direct snapshot 933, a headless snapshot 954 eseményt
-  tartalmazott. Ez önmagában nem bizonyít hibát, de a teljes tartalmi paritás
-  még nem tekinthető lezártnak;
-- egy mintavételben a memóriahasználat nem utalt RAM-nyomásra: Chrome ~786 MiB,
-  direct ~268 MiB, selector ~215 MiB, SharpX ~202 MiB, Vegas ~80 MiB.
+- a TippmixPro headless collector írja a kanonikus snapshotot;
+- a direct és a headless eltérés miatt a direct production forrásként nem
+  elfogadott, még akkor sem, ha a kapcsolat- és snapshot-health frissnek látszik;
+- a korábbi direct/selector memória- és paritásmérések történeti diagnosztikai
+  adatok, nem production állapot.
 
 A 15 perces monitor naplója:
 `runtime/monitoring/tippmixpro-15m.log`. A háttérsession megszűnhet, ezért a
@@ -96,23 +82,11 @@ használj `down --remove-orphans` parancsot, ha a cél csak a stack leállítás
 
 ### Jelenlegi worktree és validáció
 
-Az új TippmixPro routing változásai a dokumentum frissítésekor még
-commitolatlanok:
-
-```text
-M  docs/HASZNALAT.md
-M  infra/docker/compose.yml
-?? src/tippmixpro_production_selector.js
-?? test/tippmixpro_production_selector.test.js
-```
-
-Az alap commit: `d11cb75 Preserve containers after direct-headless comparator runs`.
-A selectorhoz három regressziós teszt készült: direct preferálás, headless
-fallback és mindkét forrás kiesése. A teljes Node tesztkészlet az
-`oddsaggregator-headless:local` Docker image-ben sikeresen lefutott: 78 passed,
-0 failed. A forrás és selector bind mounttal kerül a containerbe, ezért ehhez a
-változáshoz image rebuild nem volt szükséges. Aktiválás előtt továbbra is
-kötelező a compose config, `git diff --check` és a health ellenőrzése.
+A direct production rollback módosítja a `infra/docker/compose.yml` és a
+kapcsolódó használati dokumentációt. A direct collector, selector és a hozzájuk
+tartozó tesztek megmaradnak külön validációs célra, de az aktív production
+Compose nem indítja őket. Aktiválás előtt kötelező a compose config,
+`git diff --check` és a headless health ellenőrzése.
 
 ### Következő session első lépései
 
@@ -124,17 +98,13 @@ docker compose -f infra/docker/compose.yml up -d
 docker compose -f infra/docker/compose.yml ps
 docker inspect --format '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' \
   oddsaggregator-chrome oddsaggregator-sharpx oddsaggregator-tippmixpro \
-  oddsaggregator-tippmixpro-direct oddsaggregator-tippmixpro-selector \
   oddsaggregator-vegas pia-gluetun
-cat runtime/data/tippmixpro_production_health.json
+jq '{generatedAt, connected, pendingWork, eventCount: (.events | length)}' \
+  runtime/data/tippmixpro_odds_snapshot.json
 ```
 
-Ezután legalább 48–72 órás direct-primary megfigyelés javasolt, headless
-fallback megtartásával. Figyelendő: direct timeout/disconnect, stale/fallback
-váltás, esemény- és odds-coverage, output freshness, restart/OOM és a
-`productionSource` értéke. A headless fallback eltávolítása csak többnapos
-stabilitás és igazolt tartalmi paritás után indokolt; addig warm safety netként
-maradjon.
+Ezután a headless TippmixPro snapshot frissességét, esemény- és odds-coverage-ét,
+restart/OOM állapotát és a kanonikus kimenet tartalmi helyességét kell figyelni.
 
 A teljes legutóbbi mérés a
 `runtime/direct-primary/parity/20260811-124950/` könyvtárban van. Ez a

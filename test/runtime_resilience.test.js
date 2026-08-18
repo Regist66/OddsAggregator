@@ -215,6 +215,33 @@ test("Tippmix collector: timed-out initialDump is cleaned up and late RESULT is 
   assert.equal(collector.expiredRequestIds.size, 0);
 });
 
+test("Tippmix collector: timed-out offer initialDump releases the offer for retry", async t => {
+  const collector = installFakeCollector(t);
+  const connecting = collector.connect();
+  const socket = FakeWebSocket.instances[0];
+  socket.open();
+  socket.receive([2, 12345, {}]);
+  await connecting;
+
+  collector.wampRequestTimeoutMs = 20;
+  collector.queuedOfferIds.add("offer-1");
+  collector.flushOffers();
+
+  const register = JSON.parse(socket.sent.at(-1));
+  assert.equal(register[0], 64);
+  assert.equal(collector.offerTopicById.has("offer-1"), true);
+  assert.equal(collector.subscribedOfferIds.has("offer-1"), false);
+
+  socket.receive([65, register[1], 7001, {}]);
+  const initialDump = JSON.parse(socket.sent.at(-1));
+  assert.equal(initialDump[0], 48);
+
+  await waitFor(() => collector.requestTimeouts === 1, 200);
+  assert.equal(collector.offerTopicById.has("offer-1"), false);
+  assert.equal(collector.subscribedOfferIds.has("offer-1"), false);
+  assert.equal(collector.queuedOfferIds.has("offer-1"), true);
+});
+
 test("Tippmix collector: topic registration queue respects the concurrency cap", async t => {
   const collector = installFakeCollector(t);
   const connecting = collector.connect();

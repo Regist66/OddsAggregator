@@ -225,6 +225,7 @@ export function browserCollectorSource() {
       subscribedTopics: new Set(),
       queuedOfferIds: new Set(),
       subscribedOfferIds: new Set(),
+      offerTopicById: new Map(),
       offerFlushTimer: null,
       matches: new Map(),
       markets: new Map(),
@@ -330,6 +331,8 @@ export function browserCollectorSource() {
             cancel(new Error("A TippmixPro WAMP kapcsolat a WELCOME előtt megszakadt."));
             if (!currentGeneration) return;
             this.connected = false;
+            this.offerTopicById.clear();
+            this.subscribedOfferIds.clear();
             this.subscribedTopics.clear();
             this.topicQueue.length = 0;
             this.topicQueueSet.clear();
@@ -366,6 +369,7 @@ export function browserCollectorSource() {
         try {
           await this.connect();
           const tournamentIds = [...this.tournaments.keys()];
+          this.offerTopicById.clear();
           this.subscribedOfferIds.clear();
           this.queuedOfferIds.clear();
           await this.subscribeTournaments(tournamentIds);
@@ -404,6 +408,7 @@ export function browserCollectorSource() {
           this.startRequestTimeout(requestId, "REGISTER " + topic, () => {
             this.pendingRegistrations.delete(requestId);
             this.subscribedTopics.delete(topic);
+            this.releaseOfferTopic(topic);
             this.drainTopicQueue();
           });
           try {
@@ -412,6 +417,7 @@ export function browserCollectorSource() {
             this.clearRequestTimeout(requestId);
             this.pendingRegistrations.delete(requestId);
             this.subscribedTopics.delete(topic);
+            this.releaseOfferTopic(topic);
             this.drainTopicQueue();
             throw error;
           }
@@ -488,6 +494,7 @@ export function browserCollectorSource() {
           this.startRequestTimeout(callId, "initialDump " + topic, () => {
             this.pendingCalls.delete(callId);
             this.subscribedTopics.delete(topic);
+            this.releaseOfferTopic(topic);
             this.drainTopicQueue();
           });
           try {
@@ -498,6 +505,7 @@ export function browserCollectorSource() {
             this.pendingCalls.delete(callId);
             this.registrationTopics.delete(registrationId);
             this.subscribedTopics.delete(topic);
+            this.releaseOfferTopic(topic);
             this.drainTopicQueue();
             throw error;
           }
@@ -520,6 +528,7 @@ export function browserCollectorSource() {
           this.pendingCalls.delete(requestId);
           if (topic) {
             this.lastError = null;
+            this.markOfferTopicReady(topic);
           }
           this.processPayload(message[4], topic);
           this.drainTopicQueue();
@@ -547,11 +556,13 @@ export function browserCollectorSource() {
           if (pendingTopic) {
             this.pendingCalls.delete(requestId);
             this.subscribedTopics.delete(pendingTopic);
+            this.releaseOfferTopic(pendingTopic);
           }
           const registrationTopic = this.pendingRegistrations.get(requestId);
           if (registrationTopic) {
             this.pendingRegistrations.delete(requestId);
             this.subscribedTopics.delete(registrationTopic);
+            this.releaseOfferTopic(registrationTopic);
           }
           this.drainTopicQueue();
           this.lastError = "TippmixPro WAMP hiba: " + JSON.stringify(message);
@@ -624,7 +635,11 @@ export function browserCollectorSource() {
       },
 
       queueOffer(offerId) {
-        if (this.closing || this.subscribedOfferIds.has(offerId)) return;
+        if (
+          this.closing ||
+          this.subscribedOfferIds.has(offerId) ||
+          this.offerTopicById.has(offerId)
+        ) return;
         this.queuedOfferIds.add(offerId);
         clearTimeout(this.offerFlushTimer);
         this.offerFlushTimer = setTimeout(() => {
@@ -651,15 +666,36 @@ export function browserCollectorSource() {
         }, delayMs);
       },
 
+      markOfferTopicReady(topic) {
+        for (const [offerId, offerTopic] of this.offerTopicById) {
+          if (offerTopic === topic) this.subscribedOfferIds.add(offerId);
+        }
+      },
+
+      releaseOfferTopic(topic, requeue = true) {
+        const offerIds = [];
+        for (const [offerId, offerTopic] of this.offerTopicById) {
+          if (offerTopic !== topic) continue;
+          this.offerTopicById.delete(offerId);
+          this.subscribedOfferIds.delete(offerId);
+          offerIds.push(offerId);
+        }
+        if (requeue) {
+          for (const offerId of offerIds) this.queueOffer(offerId);
+        }
+      },
+
       flushOffers() {
         const ids = [...this.queuedOfferIds];
         this.queuedOfferIds.clear();
         for (let index = 0; index < ids.length; index += 30) {
           const chunk = ids.slice(index, index + 30);
+          const topic = BASE + "bettingOffers/" + chunk.join(",");
+          for (const id of chunk) this.offerTopicById.set(id, topic);
           try {
-            this.subscribeAndDump(BASE + "bettingOffers/" + chunk.join(","));
-            for (const id of chunk) this.subscribedOfferIds.add(id);
+            this.subscribeAndDump(topic);
           } catch (error) {
+            this.releaseOfferTopic(topic, false);
             for (const id of ids.slice(index)) this.queuedOfferIds.add(id);
             throw error;
           }
@@ -940,6 +976,8 @@ export function browserCollectorSource() {
         this.pendingRequestTimers.clear();
         this.pendingCalls.clear();
         this.pendingRegistrations.clear();
+        this.offerTopicById.clear();
+        this.subscribedOfferIds.clear();
         this.topicQueue.length = 0;
         this.topicQueueSet.clear();
         this.expiredRpcIds.clear();
