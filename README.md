@@ -1,65 +1,46 @@
 # OddsAggregator
 
-Labdarúgó Match Odds aggregátor SharpX, TippmixPro és Vegas adatforrásokhoz,
-élő eseményeknél 1 másodperces közös kimenettel és SharpX lay alapú
-surebet-kereséssel.
+Labdarúgó oddsaggregátor SharpX, TippmixPro és Vegas adatforrásokhoz. A
+projekt a három monitort és a Chrome/CDP réteget Docker Compose-ból futtatja.
 
 ## Könyvtárak
 
-- `src/` – a három Node.js monitor;
-- `bin/` – a teljes stack egylépéses indítószkriptje;
+- `src/` – a három Node.js monitor és közös moduljaik;
 - `config/` – csapatnév-aliasok;
-- `data/` – generált oddslisták és belső snapshotok;
-- `logs/` – futási és hibanaplók;
-- `docs/` – teljes dokumentáció és session-handoff.
+- `infra/docker/` – Dockerfile, Compose-konfiguráció és healthcheckek;
+- `runtime/` – futás közben generált snapshotok, oddslisták és lockok;
+- `docs/` – használati és projektkontextus-dokumentáció.
 
-## Dokumentáció
+## Követelmények
 
-- [Használat és indítás](docs/HASZNALAT.md)
-- [Projektkontextus új sessionhöz](docs/PROJECT_CONTEXT.md)
-- [Technikai adatgyűjtési terv](docs/sharpx-adatgyujtesi-terv.md)
+- Linux és Docker Engine Compose v2 támogatással;
+- a felhasználónak hozzáférés a Docker daemonhoz;
+- futó, healthy `pia-gluetun` konténer a production hálózati névtérhez;
+- a PIA/Gluetun konfiguráció a repón kívül található.
 
-## Fejlesztés Dockerből
+A hoston nem szükséges Node.js vagy Chrome. Az image Node.js 24.18.0-at és
+Chromiumot tartalmaz. A projektnek nincs külső npm-függősége, ezért nincs
+`npm install` lépés.
 
-A hoston nem szükséges Node.js-t telepíteni. A fejlesztői image ugyanazt a
-Node.js 24.18.0 verziót használja, mint a headless production image, a
-repositoryt pedig közvetlenül mountolja. A Chrome és a VPN nem része ennek a
-rétegnek.
-
-Teljes tesztkészlet:
+## Indítás
 
 ```bash
-docker compose -f infra/docker/compose.dev.yml run --rm dev
+docker compose -f infra/docker/compose.yml config --quiet
+docker compose -f infra/docker/compose.yml up -d --build
+docker compose -f infra/docker/compose.yml ps
 ```
 
-Egy fájl statikus ellenőrzése:
+Naplók:
 
 ```bash
-docker compose -f infra/docker/compose.dev.yml run --rm dev \
-  node --check src/sharpx_odds_monitor.js
+docker compose -f infra/docker/compose.yml logs -f --tail=100
 ```
 
-Interaktív fejlesztői shell:
+Leállítás:
 
 ```bash
-docker compose -f infra/docker/compose.dev.yml run --rm --entrypoint bash dev
+docker compose -f infra/docker/compose.yml down --remove-orphans
 ```
 
-Az image-et csak a Node-verzió vagy a Docker-konfiguráció módosításakor kell
-újraépíteni; a forráskód módosításai azonnal látszanak a konténerben.
-
-Fő kimenetek:
-
-- `data/combined_odds.txt`
-- `data/football/surebets_live_odds.txt`
-
-Ajánlott production indítás (headless primary):
-
-```powershell
-& .\bin\headless_primary.ps1 Start
-& .\bin\headless_primary.ps1 Status
-```
-
-A látható Chrome-os rollback/referencia stack: `bin\start_stack.ps1`.
-
-Az aktuális priorizált technikai audit: [Projekt-review – 2026-08-07](docs/REVIEW_2026-08-07.md).
+Részletes leírás: [docs/HASZNALAT.md](docs/HASZNALAT.md). A projekt aktuális
+állapota: [docs/PROJECT_CONTEXT.md](docs/PROJECT_CONTEXT.md).

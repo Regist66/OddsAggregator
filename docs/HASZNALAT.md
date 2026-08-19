@@ -1,614 +1,170 @@
-# OddsAggregator használata és indítása
+# OddsAggregator használata
+
+Ez a dokumentum a jelenlegi Linux + Docker Compose üzemeltetést írja le. A
+korábbi Windows/PowerShell, fejlesztői és direct/canary futtatók eltávolításra
+kerültek.
 
 ## Követelmények
 
-- Windows és PowerShell;
-- Node.js 22 vagy újabb helyi futtatáshoz; Dockeres fejlesztésnél ez nem kell;
-- Chrome távoli hibakeresési porttal: `9222`;
-- működő SOCKS5 proxy: `127.0.0.1:1080`;
-- három megnyitott sportoldal: SharpX, TippmixPro és Vegas.
+- Linux;
+- Docker Engine és `docker compose` v2;
+- a felhasználó hozzáférése a Docker daemonhoz;
+- futó, healthy `pia-gluetun` konténer.
 
-## Fejlesztői környezet Dockerből
+A normál stack minden Node.js- és Chromium-függőséget az image-ben biztosít.
+Host Node.js, Chrome, npm vagy Python telepítése nem szükséges. A PIA/Gluetun
+konfiguráció nem része ennek a repónak; a projekt a már futó, `pia-gluetun`
+nevű konténer hálózati névterét használja.
 
-A tesztekhez és a statikus ellenőrzésekhez használható külön fejlesztői image.
-Ez nem indít Chrome-ot, nem használja a `pia-gluetun` konténert, és a
-repositoryt mountolja, ezért a forráskód módosítása után nincs szükség
-újraépítésre.
-
-Teljes tesztkészlet:
-
-```powershell
-docker compose -f .\infra\docker\compose.dev.yml run --rm dev
-```
-
-Statikus ellenőrzés:
-
-```powershell
-docker compose -f .\infra\docker\compose.dev.yml run --rm dev `
-  node --check src\sharpx_odds_monitor.js
-```
-
-Interaktív shell:
-
-```powershell
-docker compose -f .\infra\docker\compose.dev.yml run --rm --entrypoint bash dev
-```
-
-Az image-et csak a Node-verzió vagy a Docker-konfiguráció módosításakor kell
-újraépíteni. A production futtatáshoz továbbra is a headless vagy direct
-indítókat használd.
-
-A projekt könyvtára:
-
-```powershell
-Set-Location 'C:\Users\regai\Projects\OddsAggregator'
-```
-
-## Ajánlott egylépéses indítás
-
-```powershell
-& .\bin\start_stack.ps1
-```
-
-## Headless elsődleges üzemeltetés
-
-Ha a headless mód az éles, kanonikus kimeneteket író üzemmód, használd az
-egységes vezérlőscriptet. Saját Chrome-profilt és alapértelmezetten a `9333`
-CDP-portot használja, de a normál, cím nélküli Node monitorok mellett nem indul
-el: azok ugyanezeket a `data\` kimeneteket írnák.
-
-```powershell
-# Indítás (a normál monitorok előbb legyenek leállítva)
-& .\bin\headless_primary.ps1 Start
-
-# Egyszeri állapotjelentés: Chrome/CDP, oldalak, monitorok, kimenetek frissessége
-& .\bin\headless_primary.ps1 Status
-
-# Folyamatos, kétmásodperces állapotnézet; kilépés: Ctrl+C
-& .\bin\headless_primary.ps1 Watch
-
-# Csak a headless primary Node monitorokat és a saját Chrome-példányát állítja le
-& .\bin\headless_primary.ps1 Stop
-
-# Célzott újraindítás
-& .\bin\headless_primary.ps1 Restart
-```
-
-Az indítás a Surebet Managert is elindítja, ha még nem fut. Ennek kihagyására:
-
-```powershell
-& .\bin\headless_primary.ps1 Start -SkipManager
-```
-
-A production monitorok ugyanarra a kanonikus kimenetre második writert nem
-engednek. A SharpX csak friss, egészséges TippmixPro/Vegas snapshotból készít
-bookmaker-sort vagy surebetet; elavult, disconnectelt, jövőbeli időbélyegű vagy
-élő/prematch fázisban eltérő adat fail-closed módon kimarad.
-
-## Headless Chrome A/B teszt
-
-A normál stack megváltoztatása nélkül, külön Chrome-profillal, CDP-porttal,
-kimeneti fájlokkal és naplókkal indítható:
-
-```powershell
-& .\bin\start_headless_ab_test.ps1
-& .\bin\measure_headless_ab_test.ps1 -DurationSeconds 900
-```
-
-Az A/B teszt alapértelmezetten a `9333` CDP-portot, a
-`data\ab-headless\` kimeneti mappát és a `logs\ab-headless\` naplókat használja.
-A headless primary ugyanezt a portot használja, ezért párhuzamos teszthez adj meg
-szabad `-CdpPort` értéket.
-A mérőszkript öt másodpercenként rögzíti a headless Chrome és a teszt-monitorok
-memóriáját, összes CPU-idejét, valamint a négy fontos kimenet frissességét.
-Értékeléskor a Chrome working setet, az 1–2 másodperc körüli fájlfrissességet és
-a `*.error.log` fájlok új hibáit kell összevetni a normál stackkel.
-
-## Háromforrásos, Chrome-mentes shadow teszt
-
-A SharpX, Vegas és TippmixPro közvetlen Node-os collectora külön futtatható,
-anélkül hogy az éles headless kimeneteket írná. A futtató forrásonként külön
-snapshotot és összevetési naplót hoz létre; a folyamatok a megadott idő végén
-maguktól leállnak.
-
-```powershell
-& .\bin\start_all_direct_shadow_test.ps1 -DurationHours 2
-```
-
-A SharpX összevető a piacállapotot, a katalógusfrissítés idejét és a nyers
-áridőbélyeget is figyelembe veszi. A Vegas és TippmixPro összevetője a
-`generatedAt`- és forrásfrissesség, eseményfedettség és snapshot-skew mellett az
-odds-, státusz-, live- és kezdésiidő-egyezést is méri. A közös launcher a Vegas
-watchlistet a direct SharpX snapshotból építi, így a három collector
-forrásoldalon Chrome nélkül fut; kanonikus combined/surebet kimenetet továbbra
-sem ír.
-
-A provider comparator rövid stale tüskékre 3 másodperces hysteresis-grace-t
-használ, miközben a nyers és az elnyomott mintákat külön telemetrizálja. A két
-snapshotot legfeljebb három gyors újraolvasással párosítja, ha a
-`generatedAt`-különbség meghaladja az 5 másodpercet. A fő kapcsolók:
-`--stale-grace-ms`, `--paired-snapshot-attempts` és
-`--paired-snapshot-retry-ms`. Live eseménytartalmi egyezést csak azonos
-fázisban és legfeljebb 3 másodperces `updatedAt`-eltéréssel számolunk;
-ez a `--event-update-max-skew-ms` kapcsolóval állítható.
-
-Induláskor a launcher legfeljebb 60 másodpercig vár mindhárom friss, olvasható
-JSON-ra. Startup hiba esetén csak az adott GUID-os run PID-jeit és konténereit
-takarítja; a `logs\all-direct-shadow\<runId>\run-manifest.json` tartalmazza a
-deadline-t és az elindított erőforrásokat.
-
-Az odds-időbélyeg toleranciája prematchnél 3 másodperc, élő piacnál 10 másodperc;
-ez az élő oddsok természetes frissítési eltolódását kezeli.
-
-A SharpX comparator csak összehasonlítható snapshotpárt számol bele az eltérés- és
-evidence-metrikákba. A freshness alapja a JSON `generatedAt` mezője, nem a fájl
-módosítási ideje. Az alapértelmezett kapuk: 30 másodperc warmup, legfeljebb
-10 másodperces normál és 5 másodperces direct tartalomkor, legfeljebb 5
-másodperces snapshot-időkülönbség, valamint mindkét oldalon legalább 95%-os
-`initializedMarkets / subscribedMarkets` lefedettség. Érvénytelen minta minden
-folyamatban lévő evidence-epizódot megszakít. A snapshot `markets` tömbje és az
-`initializedMarkets` számláló is sémaellenőrzést kap; hibás vagy ellentmondó
-snapshot nem kerül összehasonlításra. A mintavételben alapértelmezetten 5
-másodpercnél hosszabb kihagyás újraindítja az evidence grace időt. A fő
-felülírások:
-`--warmup-ms`, `--normal-max-content-age-ms`, `--direct-max-content-age-ms`,
-`--max-snapshot-skew-ms`, `--max-observation-gap-ms` és
-`--min-coverage-ratio`.
-
-## WSL direct primary smoke és üzemeltetés
-
-WSL alatt a Chrome-mentes primary stack Docker Compose-ból indítható. A direct
-collectorok a `pia-gluetun` hálózati névterét használják, az output aggregator
-pedig a `runtime/direct-primary/` elkülönített fájljaiba ír.
+Ellenőrzés:
 
 ```bash
-./infra/docker/start-direct.sh 15
-./infra/docker/status-direct.sh
-docker compose -f infra/docker/compose.direct.yml logs -f --tail=100
+docker compose version
+docker info
+docker inspect --format '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' pia-gluetun
 ```
 
-A 15 perces futás lejárta után az eredmények a
-`runtime/direct-primary/` alatt maradnak. A stack leállítása:
+Ha a Docker sockethez nincs hozzáférés, a felhasználót hozzá kell adni a
+`docker` csoporthoz, majd új bejelentkezés szükséges:
 
 ```bash
-./infra/docker/stop-direct.sh
+sudo usermod -aG docker "$USER"
+newgrp docker
 ```
 
-A `direct_primary_health.json` forrásonként mutatja a frissességet és a
-fail-closed állapotot. A SharpX direct coverage külön jelzi a renderelhető
-piacok arányát és a katalógussal elszámolt piacok arányát; a pusztán
-végrehajtható lay-ár nélküli (`not-renderable`) piac nem blokkolja az outputot.
-Átmeneti `not-ready`/accounting eltérés mellett az output akkor marad aktív,
-ha a renderelhető coverage legalább 90%; ilyenkor a health állapot
-`fresh-degraded`. A 90% alatti coverage továbbra is fail-closed. A headless production stack változatlanul a
-`infra/docker/compose.yml` fájllal kezelhető, ezért a direct smoke nem írja felül
-annak kanonikus kimeneteit.
+## Konfiguráció ellenőrzése és indítás
 
-## WSL direct production canary profile
-
-Az első direct production lépéshez külön, folyamatosan futó és passzív canary
-profile készült. A profile nem használ duration-paramétert és nem igényli az
-`ALLOW_PARALLEL_DIRECT=1` kapcsolót, ezért a headless production stack mellett
-is elindítható. A collectorkimenetek és a direct aggregátor eredményei a
-`runtime/direct-production/` könyvtárba kerülnek; a kanonikus
-`runtime/data/` fájlokat nem írják.
-
-Indítás, állapotellenőrzés és leállítás:
+Az image build előtt ellenőrizd a Compose-konfigurációt:
 
 ```bash
-./infra/docker/start-direct-production.sh
-./infra/docker/status-direct-production.sh
-docker compose -f infra/docker/compose.direct-production.yml logs -f --tail=100
-./infra/docker/stop-direct-production.sh
+docker compose -f infra/docker/compose.yml config --quiet
 ```
 
-Ez jelenleg passzív összevetési profile, de már tartalmazza a
-`restart: unless-stopped` policyt, a collector- és aggregator-watchdogot,
-tartalmi output freshness healthcheckeket, korlátozott Docker log-retentiont
-és az atomikusan frissített `runtime/direct-production/run-manifest.json`
-állapotfájlt. A kanonikus output promóciója és az automatikus rollback még a
-következő migrációs lépés része. A profile a `pia-gluetun` meglétét, futását és
-health állapotát, valamint a headless image meglétét induláskor ellenőrzi.
-
-### Stabilitási és izolációs szabályok
-
-A production headless monitorok output-frissesség alapú supervisor alatt futnak.
-Ha egy monitor 120 másodpercig nem frissíti a heartbeat fájlját, a supervisor
-kilép, a Compose pedig az `unless-stopped` szabály szerint újraindítja a
-monitor konténert. A `docker compose ps` ezért a monitorok health állapotát is
-mutatja.
-
-SharpX-nél a websocketek 10 másodperces handshake-, illetve 30 másodperces
-frame-timeout után kontrolláltan újracsatlakoznak. Ha minden socket egyszerre
-egészségtelen, 30 másodperc után a collector újrainicializálódik. Amíg a
-SharpX-hoz feliratkozott piacok száma nem nulla, de egyetlen piac sem
-inicializált, a monitor nem írja felül az utolsó jó `combined_odds.txt` és
-`surebets_live_odds.txt` kimenetet.
-
-A SharpX output csak akkor kerül publikálásra, ha az inicializált/feliratkozott
-piacok aránya legalább 90%. Coverage-hiba esetén az utolsó jó output legfeljebb
-5 percig marad érvényes; utána fail-closed `UNAVAILABLE` kimenet készül. A
-status snapshot `outputHealth` mezője és a Docker healthcheck ezt a tartalmi
-állapotot is ellenőrzi.
-
-A direct smoke indító alapértelmezetten megtagadja a futó production stack
-melletti indulást, mert mindkettő a `pia-gluetun` network namespace-ét használná.
-
-### TippmixPro headless production routing
-
-Az éles `infra/docker/compose.yml` a TippmixPro headless collectort közvetlenül
-a kanonikus `runtime/data/tippmixpro_odds_snapshot.json` fájlba irányítja. A
-direct collector és a production selector nincs az aktív Compose-ban, ezért a
-hibás direct snapshot nem kerülhet vissza a production adatútba.
-
-A direct collector továbbra is külön shadow/validációs futtatásként használható,
-de annak kimenetét nem szabad kanonikus production forrásként használni.
-Tudatos, párhuzamos futtatás csak explicit engedéllyel indítható:
+Build és indítás:
 
 ```bash
-ALLOW_PARALLEL_DIRECT=1 ./infra/docker/start-direct.sh 15
+docker compose -f infra/docker/compose.yml up -d --build
 ```
 
-Docker Desktop/WSL alatt a headless és direct oldalak páros, 2 órás összevetése:
+A stack szolgáltatásai:
+
+- `chrome` – headless Chromium CDP-vel, a `9333` porton;
+- `tippmixpro` – TippmixPro monitor;
+- `sharpx` – SharpX monitor és közös oddslista/surebet kimenet;
+- `vegas` – Vegas monitor.
+
+A monitorok a Chrome health állapotára, egymás szükséges snapshotjaira és a
+saját output healthcheckjükre támaszkodnak.
+
+## Állapot és naplók
 
 ```bash
-./infra/docker/start-direct-headless-comparator.sh 120
+docker compose -f infra/docker/compose.yml ps
+docker compose -f infra/docker/compose.yml logs -f --tail=100
+docker compose -f infra/docker/compose.yml logs -f --tail=100 chrome
+docker compose -f infra/docker/compose.yml logs -f --tail=100 sharpx
 ```
 
-A futtató közös VPN-en indítja a headless és direct collectort, megvárja a
-friss snapshotokat, majd Vegas/TippmixPro/SharpX comparatorokat indít. A
-futásazonosítós eredmények a `runtime/comparator/direct-headless/<runId>/`
-könyvtárba kerülnek; a közös deadline után a teszt által indított stackeket
-automatikusan leállítja, de a Docker-konténereket és a hálózatokat megőrzi a
-következő indításhoz.
+Healthcheckek és konténerállapot:
 
-Docker Desktop/WSL alatt legalább 4 GiB memória és 2 vCPU javasolt ehhez a
-Chrome + három monitor + VPN kombinációhoz. A Compose nem tudja növelni a
-Docker Desktop/WSL VM memóriáját; azt a host beállításaiban kell megadni.
-Ellenőrzéshez használd a `free -h`, `vmstat 1 5` és `docker stats --no-stream`
-parancsokat. A teljesen kihasznált swap és tartós memory PSI azt jelzi, hogy a
-host erőforrása továbbra is szűk.
-
-A SharpX direct collector a socket-tömörítést óvatosan végzi: alapértelmezetten
-három egymást követő katalógusciklusban fennálló alulterheltség után indítja el,
-majd két tömörítés között legalább 5 percet vár. A viselkedés a
-`--socket-compaction-confirmations` és `--socket-compaction-ms` kapcsolókkal
-hangolható.
-
-A dinamikus, lapozott SharpX-katalógusból egy piac csak három egymást követő,
-sikeres frissítési körös hiány után kerül ki; ezt a
-`--catalogue-absence-confirmations` módosítja. A recovery az aktuális owner
-socket `OPEN`/`ready` állapotát és az ár generációját is ellenőrzi. A nem-ready
-vagy stale piacokat először újra feliratkoztatja, ismételt sikertelenségnél pedig
-csak az érintett socketet indítja újra. Az age-alapú stale-határ csak élő,
-`OPEN` piacnál aktív, alapértéke 60 másodperc. Prematch piacnál alapértelmezés
-szerint ki van kapcsolva, mert a SharpX stream eseményvezérelt; a socket teljes
-frissességét ettől függetlenül a frame-idő figyeli. A market-triggered restartok
-száma ciklusonként legfeljebb 2, és socketenként 2 percről legfeljebb 15 percre
-növekvő cooldown védi a collectort a restart-hullámtól.
-
-A `sharpx_status_snapshot.json` `marketDiagnostics` blokkja okonkénti számlálót
-és korlátozott ID-listát ír a `catalogue-missing`, `hysteresis-retained`,
-`not-ready`, `stale` és `closed` állapotokról. Ugyanitt látható a nyers/egyedi/
-duplikált katalógusméret, valamint a socket close/reconnect és market-recovery
-számláló is. A lezárt piac az aktív kimenetből azonnal kiesik, diagnosztikai
-rekordja alapértelmezetten még 5 percig megmarad.
-
-Tiszta A/B erőforrásmérésnél a két stack nem futhat egyidejűleg. A
-`run_clean_resource_ab_test.ps1` a már elindított normál baseline-mérés befejezése
-után automatikusan leállítja a normál stacket, elvégzi az izolált headless mérést,
-majd visszaállítja a normál Chrome-ot, monitorokat és a Surebet Managert.
-
-## 24 órás headless shadow stabilitási teszt
-
-A normál stack marad az éles kimeneti forrás; a headless stack külön profillal,
-alapból `9334` CDP-porttal és futásonként elkülönített mappákban dolgozik. Az összehasonlító
-másodpercenként figyeli a kimeneteket. A bizonyítékcsomag csak legalább 30
-másodpercig fennálló, legalább 0,5% nettó edge-ű,
-esemény/bookmaker/1X2-kimenet szintű surebet-eltéréshez készül.
-
-```powershell
-& .\bin\start_shadow_stability_test.ps1 -DurationHours 24
+```bash
+docker inspect --format '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' \
+  oddsaggregator-chrome oddsaggregator-tippmixpro oddsaggregator-sharpx oddsaggregator-vegas
 ```
 
-A futás végén a headless Chrome és monitorai automatikusan leállnak. A futáshoz
-tartozó `logs\shadow-stability\<id>\summary.json` és `report.md` összegzi a
-frissességi hibákat, hibanapló-növekedéseket, snapshot-eltéréseket és a normál-only/
-headless-only surebet epizódokat. A jelentős eltérésekhez tartozó `evidence\*.json`
-fájlok a két oldal aktuális oddsait, fájlkorát és eseményállapotát is elmentik.
-Az `surebetPresent` és `missingFrom` mezők egyértelműen jelzik, melyik oldalon
-volt jelen, illetve hiányzott a surebet; a státusz-összevetés ettől függetlenül
-mindkét oldalon ugyanarra az eseményre történik.
-Mindkét oldalon szerepel egy `sharpXQuote` blokk is: a SharpX 1/X/2 best-lay
-oddsokkal, azok `oddsUpdatedAt` forrásidejével és a státuszsnapshot
-`statusSnapshotGeneratedAt` idejével.
-A SharpX állapotokat a `data\sharpx_status_snapshot.json` tartalmazza. A részletes
-`health.jsonl` és `events.jsonl` csak diagnosztikához szükséges, nem az éles
-kimeneteket módosítja. A `summary.json` `completionStatus` mezője jelzi a
-szabályos lezárást; a `snapshotFreshness`, `sharpXCoverage` és
-`monitorDiagnostics` blokkokban a fájlkorok, coverage-minimumok, CDP timeoutok,
-recovery/initialization és output hibák kumulatív számlálói találhatók.
+## Kimeneti fájlok
 
-Élő összevetéshez minden shadow run a saját
-`data\shadow-headless\<id>\football\surebets_live_odds.txt` fájlját használja; a
-normál fájl továbbra is `data\football\surebets_live_odds.txt`. A
-`bin\watch_shadow_surebets.ps1` automatikusan a legutóbbi run fájlját választja,
-vagy a `-HeadlessFile` kapcsolóval explicit útvonal adható. Mivel a monitorok
-atomikusan cserélik a fájlokat, a `Get-Content -Wait` nem követi megbízhatóan a
-változásokat.
+A Compose a repó `runtime/data/` könyvtárát mountolja:
 
-A szkript szükség esetén elindítja a proxyt használó, `9222`-es CDP-portú
-Chrome-ot, megnyitja a három szükséges sportoldalt, elindítja a Surebet Manager
-GUI-t, majd háttérben a TippmixPro, SharpX és Vegas monitorokat. A már futó
-komponensekből nem indít második példányt. A Manager közvetlenül a
-`data\football\surebets_live_odds.txt` fájlt kapja javaslati forrásként.
+- `runtime/data/tippmixpro_odds_snapshot.json`;
+- `runtime/data/sharpx_status_snapshot.json`;
+- `runtime/data/sharpx_watchlist.json`;
+- `runtime/data/combined_odds.txt`;
+- `runtime/data/football/surebets_live_odds.txt`;
+- `runtime/data/vegas_odds_snapshot.json`.
 
-A Manager kihagyható:
+A fájlokat a monitorok atomikusan frissítik, ezért olvasás közben lockfájlok is
+megjelenhetnek. A `data/`, `logs/` és `runtime/` könyvtárak generált állapotot
+tartalmaznak, nem a Gitből származó forráskódot.
 
-```powershell
-& .\bin\start_stack.ps1 -SkipManager
+## Leállítás és újraépítés
+
+Normál leállítás:
+
+```bash
+docker compose -f infra/docker/compose.yml down --remove-orphans
 ```
 
-Eltérő CDP-port vagy proxy is megadható:
+Csak az image újraépítése és újraindítás:
 
-```powershell
-& .\bin\start_stack.ps1 -CdpPort 9333 -ProxyServer 'socks5://127.0.0.1:1080'
+```bash
+docker compose -f infra/docker/compose.yml up -d --build --force-recreate
 ```
 
-Nincs `npm install`: a monitorok csak a Node.js beépített moduljait és a
-böngészőben futó oldalak meglévő kapcsolatait használják.
+Az output könyvtárak törlése nem része a leállításnak. Generált adatok törlése
+előtt készíts mentést, ha a snapshotokra szükség van.
 
-## 1. Chrome elindítása
+## Környezeti változók
 
-Ha a megfelelő Chrome már fut a `9222` porton, ezt a lépést ki kell hagyni. Új
-elkülönített Chrome-példány indításának példája:
-
-```powershell
-& 'C:\Program Files\Google\Chrome\Application\chrome.exe' `
-  --remote-debugging-port=9222 `
-  --proxy-server='socks5://127.0.0.1:1080' `
-  --user-data-dir='C:\Users\regai\AppData\Local\OddsAggregatorChrome'
-```
-
-Nyisd meg ebben a Chrome-ban:
-
-- `https://sharpxch.com/player/sport/1`
-- `https://www.tippmixpro.hu/hu/fogadas/i`
-- `https://vegas.hu/sports/live`
-
-Bejelentkezés nem szükséges. Várd meg, amíg mindhárom sportfelület betölt.
-
-A CDP ellenőrzése:
-
-```powershell
-Invoke-RestMethod 'http://127.0.0.1:9222/json' |
-  Select-Object title, url
-```
-
-## 2. Monitorok indítása
-
-### Egyszerű módszer: három PowerShell ablak
-
-Első ablak:
-
-```powershell
-Set-Location 'C:\Users\regai\Projects\OddsAggregator'
-node .\src\tippmixpro_odds_monitor.js
-```
-
-Második ablak:
-
-```powershell
-Set-Location 'C:\Users\regai\Projects\OddsAggregator'
-node .\src\sharpx_odds_monitor.js
-```
-
-Harmadik ablak:
-
-```powershell
-Set-Location 'C:\Users\regai\Projects\OddsAggregator'
-node .\src\vegas_odds_monitor.js
-```
-
-Az ajánlott sorrend TippmixPro → SharpX → Vegas. A SharpX létrehozza a Vegas
-által olvasott watchlistet. Induláskor néhány másodpercig még hiányozhatnak a
-bookmaker-sorok; a következő ciklusokban automatikusan megjelennek.
-
-### Háttérben, naplófájlokkal
-
-```powershell
-$project = 'C:\Users\regai\Projects\OddsAggregator'
-$node = 'C:\Program Files\nodejs\node.exe'
-
-Start-Process -FilePath $node `
-  -ArgumentList (Join-Path $project 'src\tippmixpro_odds_monitor.js') `
-  -WorkingDirectory $project -WindowStyle Hidden `
-  -RedirectStandardOutput (Join-Path $project 'logs\tippmixpro_odds_monitor.log') `
-  -RedirectStandardError (Join-Path $project 'logs\tippmixpro_odds_monitor.error.log')
-
-Start-Process -FilePath $node `
-  -ArgumentList (Join-Path $project 'src\sharpx_odds_monitor.js') `
-  -WorkingDirectory $project -WindowStyle Hidden `
-  -RedirectStandardOutput (Join-Path $project 'logs\sharpx_odds_monitor.log') `
-  -RedirectStandardError (Join-Path $project 'logs\sharpx_odds_monitor.error.log')
-
-Start-Process -FilePath $node `
-  -ArgumentList (Join-Path $project 'src\vegas_odds_monitor.js') `
-  -WorkingDirectory $project -WindowStyle Hidden `
-  -RedirectStandardOutput (Join-Path $project 'logs\vegas_odds_monitor.log') `
-  -RedirectStandardError (Join-Path $project 'logs\vegas_odds_monitor.error.log')
-```
-
-Ne indíts új példányt, ha ugyanaz a monitor már fut.
-
-## 3. Működés ellenőrzése
-
-Futó monitorok:
-
-```powershell
-Get-CimInstance Win32_Process |
-  Where-Object {
-    $_.Name -eq 'node.exe' -and $_.CommandLine -match 'odds_monitor'
-  } |
-  Select-Object ProcessId, CommandLine
-```
-
-Kimeneti fájlok frissítési ideje:
-
-```powershell
-Get-Item .\data\combined_odds.txt, .\data\football\surebets_live_odds.txt, `
-  .\data\tippmixpro_odds_snapshot.json, .\data\vegas_odds_snapshot.json |
-  Select-Object Name, Length, LastWriteTime
-```
-
-Az ember által olvasható oddslista:
-
-```powershell
-Get-Content .\data\combined_odds.txt -Encoding utf8 -Wait
-```
-
-Surebet lista:
-
-```powershell
-Get-Content .\data\football\surebets_live_odds.txt -Encoding utf8 -Wait
-```
-
-Normál és headless lista élő összevetése:
-
-```powershell
-& .\bin\watch_shadow_surebets.ps1
-```
-
-Hibák:
-
-```powershell
-Get-Content .\logs\sharpx_odds_monitor.error.log -Encoding utf8 -Tail 50
-Get-Content .\logs\tippmixpro_odds_monitor.error.log -Encoding utf8 -Tail 50
-Get-Content .\logs\vegas_odds_monitor.error.log -Encoding utf8 -Tail 50
-```
-
-Normál működésnél a `combined_odds.txt` és `surebets_live_odds.txt` másodpercenként
-új időbélyeget kap. Ha nincs surebet, a `surebets_live_odds.txt` csak az aktuális fejlécet
-tartalmazza.
-
-A 300 EUR prematch matched amount határ csak a `combined_odds.txt` listájára
-vonatkozik. A surebet-kereső az ennél kisebb likviditású SharpX piacokat is
-figyeli, ezért a `surebets_live_odds.txt` olyan eseményt is tartalmazhat, amely a közös
-oddslistában nem látható.
-
-## 4. Leállítás
-
-Előtérben futó monitornál nyomj `Ctrl+C`-t az adott ablakban.
-
-Háttérfolyamatok célzott leállítása:
-
-```powershell
-$project = 'C:\Users\regai\Projects\OddsAggregator'
-Get-CimInstance Win32_Process |
-  Where-Object {
-    $_.Name -eq 'node.exe' -and
-    ($_.CommandLine -like "*$project\src\sharpx_odds_monitor.js*" -or
-     $_.CommandLine -like "*$project\src\tippmixpro_odds_monitor.js*" -or
-     $_.CommandLine -like "*$project\src\vegas_odds_monitor.js*")
-  } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId }
-```
-
-## 5. Aliasszótár bővítése
-
-A `config\team_aliases.json` canonical csapatneveket és az ismert névváltozatokat
-tartalmazza. Példa:
-
-```json
-{
-  "teams": {
-    "qpr": [
-      "QPR",
-      "Queens Park Rangers"
-    ]
-  }
-}
-```
-
-A fájl mentése után a monitorok automatikusan újraolvassák. Ugyanazt az aliast
-ne add több canonical csapathoz. Az új párt előbb kezdési idő és bajnokság
-alapján ellenőrizd.
-
-## 6. Beállítások környezeti változókkal
-
-A leggyakrabban használt felülírások:
+A legfontosabb, Compose-ból felülírható értékek:
 
 | Változó | Alapérték |
-|---|---|
-| `SHARPX_CDP_ENDPOINT` | `http://127.0.0.1:9222` |
+|---|---:|
+| `MONITOR_STALE_MS` | `120000` |
+| `MONITOR_STARTUP_GRACE_MS` | `180000` |
+| `MONITOR_POLL_MS` | `10000` |
 | `SHARPX_CDP_COMMAND_TIMEOUT_MS` | `60000` |
-| `TIPPMIXPRO_CDP_ENDPOINT` | `http://127.0.0.1:9222` |
-| `VEGAS_CDP_ENDPOINT` | `http://127.0.0.1:9222` |
-| `SHARPX_PREMATCH_MIN_MATCHED` | `300` EUR |
-| `SHARPX_OUTPUT_INTERVAL_MS` | `1000` |
-| `SHARPX_PREMATCH_RENDER_MS` | `5000` |
+| `SHARPX_OUTPUT_MIN_COVERAGE_RATIO` | `0.90` |
+| `SHARPX_LAST_GOOD_OUTPUT_TTL_MS` | `300000` |
 | `SHARPX_WEBSOCKET_HANDSHAKE_TIMEOUT_MS` | `10000` |
 | `SHARPX_WEBSOCKET_FRAME_TIMEOUT_MS` | `30000` |
 | `SHARPX_WEBSOCKET_RECONNECT_BASE_MS` | `1000` |
 | `SHARPX_WEBSOCKET_RECONNECT_MAX_MS` | `10000` |
 | `SHARPX_ALL_SOCKET_RECOVERY_MS` | `30000` |
-| `SHARPX_OUTPUT_MIN_COVERAGE_RATIO` | `0.90` |
-| `SHARPX_LAST_GOOD_OUTPUT_TTL_MS` | `300000` |
-| `SHARPX_OUTPUT_STATE_FILE` | `data\sharpx_output_state.json` |
-| `TIPPMIXPRO_OUTPUT_INTERVAL_MS` | `1000` |
-| `VEGAS_OUTPUT_INTERVAL_MS` | `1000` |
-| `VEGAS_LIVE_REFRESH_MS` | `1000` |
-| `VEGAS_LIVE_INITIAL_DELAY_MS` | `0`; direct stack alapértelmezésben `500` ms offset |
-| `VEGAS_LIVE_REQUEST_RETRIES` | `1` |
-| `VEGAS_LIVE_RETRY_DELAY_MS` | `150` |
-| `VEGAS_LIVE_REQUEST_BUDGET_MS` | `4500` összesített live request budget |
-| `VEGAS_LIVE_FAILURE_BACKOFF_MS` | `1000`; timeout után exponenciális backoff |
+| `VEGAS_LIVE_REQUEST_BUDGET_MS` | `4500` |
+| `VEGAS_LIVE_FAILURE_BACKOFF_MS` | `1000` |
 | `VEGAS_LIVE_FAILURE_BACKOFF_MAX_MS` | `10000` |
-| `VEGAS_LIVE_LATENCY_SAMPLE_SIZE` | `600` gördülő live latency minta |
-| `VEGAS_REQUEST_PHASE_SAMPLE_SIZE` | `120` direct DNS/TCP/TLS/TTFB/body fázisminta |
 | `VEGAS_ENHANCED_DETAIL_CONCURRENCY` | `12` |
-| `VEGAS_MATCHED_REFRESH_MS` | `5000` |
-| `VEGAS_MATCHED_REQUEST_TIMEOUT_MS` | `8000` |
-| `VEGAS_MATCHED_REQUEST_RETRIES` | `1` |
-| `VEGAS_MATCHED_RETRY_DELAY_MS` | `250` |
-| `SHARPX_OUTPUT_FILE` | `data\combined_odds.txt` a projektben |
-| `SUREBETS_OUTPUT_FILE` | `data\football\surebets_live_odds.txt` a projektben |
 
-Példa eltérő prematch limitre egy PowerShell ablakban:
+Példa:
 
-```powershell
-$env:SHARPX_PREMATCH_MIN_MATCHED = '500'
-node .\src\sharpx_odds_monitor.js
+```bash
+MONITOR_STALE_MS=180000 \
+  docker compose -f infra/docker/compose.yml up -d
 ```
 
-## 7. Gyakori hibák
+## Gyakori hibák
 
-### „Nincs megnyitva ... oldal”
+### A `pia-gluetun` konténer nem található
 
-Ellenőrizd a `9222/json` targetlistát, a pontos oldalt és azt, hogy ugyanazt a
-Chrome-példányt használod-e, amelyen a remote debugging engedélyezett.
+A normál Compose-fájl minden service-nél a `pia-gluetun` hálózati névterét
+használja. Indítsd el a külső Gluetun/PIA stack-et, majd ellenőrizd:
 
-### Nem frissülnek a Vegas sorok
+```bash
+docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' pia-gluetun
+```
 
-Ellenőrizd a Vegas folyamatot, a `data\vegas_odds_snapshot.json` idejét, valamint a
-`data\sharpx_watchlist.json` létét. Az első teljes Vegas-katalógus felépítése néhány
-másodpercet igényelhet.
+### A Chrome nem healthy
 
-### Nem frissülnek a TippmixPro sorok
+Nézd meg a Chrome naplóját és healthcheckjét:
 
-Ellenőrizd, hogy a TippmixPro sportoldal teljesen betöltött-e, és nézd meg a
-`logs\tippmixpro_odds_monitor.error.log` fájlt. Oldalfrissítés után a collector
-automatikusan megpróbál helyreállni.
+```bash
+docker compose -f infra/docker/compose.yml logs --tail=200 chrome
+docker inspect --format '{{json .State.Health}}' oddsaggregator-chrome
+```
 
-### Kevés a párosított esemény
+### A monitor outputja stale vagy hiányzik
 
-Hasonlítsd össze a kezdési időt, bajnokságot és a két csapatnevet. Ellenőrzött
-névváltozat esetén egészítsd ki a `config\team_aliases.json` fájlt.
-Az ismert, pontosan egyórás forráseltérést a rendszer automatikusan kezeli, de
-csak erős kétoldali névegyezés és azonos bajnokságcsalád esetén.
+Ellenőrizd a függőségi sorrendet és a kimeneteket:
 
-### A surebet fájl üresnek tűnik
+```bash
+docker compose -f infra/docker/compose.yml ps
+ls -l runtime/data
+docker compose -f infra/docker/compose.yml logs --tail=200 tippmixpro sharpx vegas
+```
 
-Ha csak a fejléc látható, pillanatnyilag nincs olyan back/lay kombináció, amely
-a 2,95%-os SharpX-jutalék után is pozitív mindkét kimenetelnél. Ez normális
-állapot.
+### Nincs host Node.js
+
+Ez Dockeres üzemnél normális. A teszt- és futtatókörnyezet Node.js 24.18.0-at
+használ az image-en belül; a forráskódot nem kell hoston `npm install`-lal
+előkészíteni.

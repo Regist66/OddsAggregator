@@ -1,5 +1,8 @@
 # SharpX valós idejű, nyilvános piaci adatainak programozott lekérése
 
+> Tervezési háttéranyag, nem az aktuális runtime telepítési útmutatója. A
+> jelenlegi Dockeres futtatást a [HASZNALAT.md](HASZNALAT.md) írja le.
+
 > Projektstruktúra: a monitorok a `src/`, a konfiguráció a `config/`, a
 > generált fájlok a `data/`, a naplók a `logs/` könyvtárban találhatók. A
 > dokumentumban szereplő rövid fájlnevek ezekre a könyvtárakra utalnak.
